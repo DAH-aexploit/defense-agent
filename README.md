@@ -33,12 +33,21 @@ Linux 커널의 NFQUEUE로 전달된 패킷을 검사해 `ACCEPT` 또는 `DROP`�
 
 에이전트가 받는 raw IP packet은 Ethernet header 없이 IP header부터 시작한다. L3/L4 parse는 각각 IP 계층과 TCP·UDP 전송 계층의 header를 읽어 주소, port, protocol과 payload를 분리하는 과정이다.
 
-detector의 독립 근거를 합산하는 방식을 independent-evidence quorum이라고 한다. 기본 DROP 임계값은 `1.0`이며, 동일한 `source`의 반복 탐지는 한 번만 반영한다. 같은 탐지의 반복 횟수가 아니라 서로 다른 근거가 함께 발견됐을 때 차단 신뢰도가 높아지는 구조다.
+각 detector는 문자열 대신 룰 ID, 근거 등급, 프로토콜 식별 근거와 선행 조건을 포함한 구조화된 `Evidence`를 반환한다. 독립 근거를 합산하는 방식을 independent-evidence quorum이라고 한다. 기본 DROP 임계값은 `1.0`이며, 동일한 `source`의 반복 탐지는 한 번만 반영한다. 같은 탐지의 반복 횟수가 아니라 서로 다른 근거가 함께 발견됐을 때 차단 신뢰도가 높아지는 구조다.
+
+근거 등급은 다음 네 가지다.
+
+- `ATTACK_PATTERN_CONFIRMED` inbound packet에서 공격 패턴 자체가 확인된 근거
+- `VIOLATION_CONFIRMED` 완전한 패킷에서 프로토콜 구조 위반이 확인된 근거
+- `CONTEXT_REQUIRED` 포트·운영 profile·상태 이력 같은 선행 조건이 충족돼야 하는 근거
+- `OBSERVATION_ONLY` 기록과 후속 분석에만 사용하며 DROP 점수에서 제외하는 근거
+
+프로토콜 식별 근거는 `STRUCTURE_VERIFIED`, `PROFILE_BOUND`, `SCHEMA_DEPENDENT`로 구분한다. 각각 패킷 구조만으로 식별 가능한 경우, 포트나 운영 profile이 함께 필요한 경우, 별도 schema나 dialect 정보가 필요한 경우를 의미한다. 식별 또는 선행 조건이 확인되지 않은 Evidence는 weight와 관계없이 DROP 점수에 포함되지 않는다.
 
 ```text
 Network packet
   → NFQUEUE / broker
-  → L3/L4 parse
+  → L3/L4 parse + structural validation
   → whitelist
   → signature + stateful detectors
   → evidence score
@@ -64,7 +73,7 @@ broker와 에이전트는 Unix domain `SOCK_SEQPACKET`으로 통신한다. 이 s
 
 broker는 패킷을 전달한 뒤 300ms 안에 verdict를 받아 커널에 적용해야 한다. 이 제한은 에이전트가 느려져 전체 네트워크 처리가 정지하는 상황을 막기 위한 runtime 계약이다.
 
-에이전트의 내부 판정 예산은 기본 50ms다. 남은 시간은 broker 통신, process scheduling과 커널 적용 지연을 위한 여유로 둔다. 패킷 처리 순서는 `parse → whitelist → detectors → score → verdict`이며 파싱 오류, detector 예외 또는 판정 예산 초과 시 서비스 가용성을 위해 ACCEPT한다.
+에이전트의 내부 판정 예산은 기본 50ms다. 남은 시간은 broker 통신, process scheduling과 커널 적용 지연을 위한 여유로 둔다. 패킷 처리 순서는 `parse → structural validation → whitelist → detectors → evidence gate → score → verdict`다. 캡처가 잘린 `INCOMPLETE`와 검사 대상이 아닌 `UNSUPPORTED`는 ACCEPT한다. 완전한 패킷에서 확인된 길이·헤더 위반인 `MALFORMED`는 구조 위반 Evidence로 평가한다. detector 예외 또는 판정 예산 초과는 서비스 가용성을 위해 ACCEPT한다.
 
 ## Installation
 
@@ -150,7 +159,7 @@ WHITELIST = [
 
 whitelist match는 즉시 ACCEPT된다. `port`를 생략하면 모든 목적지 포트에 적용되므로 공격 traffic의 우회 경로가 되지 않도록 port와 요청 형태를 좁게 지정해야 한다.
 
-### Parameter and Rate Policies
+### Parameter and Packet Burst Policies
 
 ```python
 PARAM_RANGES = {
@@ -180,6 +189,8 @@ RATE_LIMIT = {
 
 rate의 기본 scope는 송신·수신 IP, 송신·수신 port와 transport protocol을 묶은 `flow`다. 여러 정상 송신자의 traffic이 합산되는 `port` scope는 정상 환경에서 측정한 요청량과 변동 범위인 burst baseline을 확인한 후에만 사용한다.
 
+`RATE_LIMIT`은 운영 인프라의 신규 TCP connection 제한이 아니다. 방어 에이전트에 전달된 packet activity를 세는 `RequestBurstDetector` 설정이며 정상 baseline 확인 전에는 설정하지 않는 것이 기본 정책이다. 기존 룰 파일과의 호환을 위해 설정 이름 `RATE_LIMIT`과 import 별칭 `RateDetector`만 유지한다.
+
 룰 적용 전 실제 TCP/UDP transport와 port, 정상 PCAP의 오탐, 정상 burst, 재연결과 sequence reset을 확인한다. sequence reset은 장비 재시작이나 재연결로 순번이 정상적으로 초기화되는 상황이다. 애매한 단일 신호는 `1.0`으로 즉시 차단하지 않고 서로 다른 근거로 조합한다.
 
 ## Protocol Detectors
@@ -203,6 +214,8 @@ DEF_RTPS_PORTS=7400
 - **RTPS / DDS** protocol profile, vendor, participant GUID와 submessage boundary 관찰. participant GUID는 DDS 참여자의 식별자이고 submessage boundary는 한 메시지 안의 세부 단위 경계
 
 현재 MAVLink parser는 dialect별 CRC-extra를 검증하지 않으므로 완전한 프로토콜 인증기가 아니라 구조적 후보 식별기다. CCSDS FECF 역시 무결성 오류를 찾을 뿐 패킷 송신자를 인증하지 않는다.
+
+MAVLink와 CCSDS는 `enforce`로 설정해도 각각 `DEF_MAVLINK_PORTS`, `DEF_CCSDS_PORTS`의 명시적 port profile이 없으면 Evidence를 DROP 점수에 반영하지 않는다. 본선 port를 확인하기 전에는 기본 `observe`를 유지한다. RTPS는 고유 `RTPS` magic으로 구조 식별이 가능하지만 본선 초기 운영 정책은 동일하게 `observe`다.
 
 ## LLM Analysis
 
@@ -257,7 +270,8 @@ docker compose logs -f team1-defender | grep DEFENDER_EVENT
 
 ## Safety Boundaries
 
-- 지원하지 않거나 파싱할 수 없는 packet은 ACCEPT
+- 캡처 불완전 packet과 지원하지 않는 protocol은 ACCEPT
+- 완전한 packet의 IPv4·IPv6·TCP·UDP 구조 위반은 Evidence gate와 임계값에 따라 DROP
 - IPv4 / IPv6 fragment는 완전 재조립 없이 ACCEPT
 - TCP는 같은 flow의 연속 sequence만 제한된 window로 결합
 - detector 예외와 verdict timeout은 ACCEPT
