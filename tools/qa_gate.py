@@ -38,7 +38,8 @@ def digest(path: Path) -> str:
 def parity() -> dict:
     """핵심 engine file의 local 개발본·Docker 배포본 동일성 검사"""
     pairs = [(ROOT / "defender.py", DEPLOY / "defender.py"),
-             (ROOT / "detectors.py", DEPLOY / "detectors.py")]
+             (ROOT / "detectors.py", DEPLOY / "detectors.py"),
+             (ROOT / "protocol_profiles.py", DEPLOY / "protocol_profiles.py")]
     details = [{"development": str(a.relative_to(DAH)), "deployment": str(b.relative_to(DAH)),
                 "sha256_development": digest(a), "sha256_deployment": digest(b),
                 "equal": a.read_bytes() == b.read_bytes()} for a, b in pairs]
@@ -51,6 +52,7 @@ def main() -> int:
     RESULTS.mkdir(exist_ok=True)
     checks = [
         run("compile", [sys.executable, "-m", "py_compile", "defender.py", "detectors.py",
+                        "protocol_profiles.py",
                         "tests/packet_util.py", "tools/pcap_analyze.py",
                         "tools/dependency_audit.py"]),
         run("dependency and license policy", [sys.executable, "tools/dependency_audit.py"]),
