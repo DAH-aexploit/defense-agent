@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import socket
 import struct
+import hmac
 import sys
 import threading
 import time
@@ -27,7 +28,7 @@ from detectors import (BoundedState, CcsdsDetector, Detector, Evidence,
                        EvidenceClass, Hit, IdentificationBasis, MavlinkDetector,
                        PacketContext, ParamRangeDetector, RateDetector,
                        RequestBurstDetector,
-                       RtpsDetector, SignatureDetector, crc16_ccitt, normalize,
+                       RtpsDetector, SignatureDetector, crc16_ccitt, mavlink_frame_crc, normalize,
                        parse_ccsds_packet, parse_mavlink_frames,
                        parse_rtps_message)
 from tests.packet_util import (build_ipv6_packet, build_packet, build_udp_packet,
@@ -361,10 +362,11 @@ class TestDetectorPlugins(unittest.TestCase):
 
 
 def _mav2(seq=1, sysid=1, compid=1, msgid=76, payload=b"", signed=False,
-          link_id=7, timestamp=1000):
+          link_id=7, timestamp=1000, valid_crc=False):
     flags = 1 if signed else 0
     header = bytes([0xFD, len(payload), flags, 0, seq, sysid, compid]) + msgid.to_bytes(3, "little")
-    frame = header + payload + b"\x00\x00"  # 구조 테스트: CRC-extra 미확정이라 값은 사용 안 함
+    crc = mavlink_frame_crc(2, header[1:] + payload, msgid) if valid_crc else None
+    frame = header + payload + ((crc or 0).to_bytes(2, "little"))
     if signed:
         frame += bytes([link_id]) + timestamp.to_bytes(6, "little") + b"\x00" * 6
     return frame
@@ -425,6 +427,81 @@ class TestMavlinkDetector(unittest.TestCase):
                         if item["rule_id"] == "MAV-02")
         self.assertFalse(evidence["identification_verified"])
 
+    @staticmethod
+    def _param_set(name, value, signed=True, seq=1):
+        payload = struct.pack("<fBB16sB", value, 1, 1,
+                              name.encode().ljust(16, b"\x00"), 9)
+        return build_udp_packet(14550, _mav2(
+            seq=seq, msgid=23, payload=payload, signed=signed,
+            timestamp=1000 + seq, valid_crc=True))
+
+    def test_param_set_out_of_range_dropped_from_decoded_float(self):
+        detector = MavlinkDetector(
+            mode="enforce", ports=[14550], require_signed=False,
+            validate_crc=True, param_ranges={"EK3_ACC_P_NSE": (0.001, 1.0)})
+        verdict, info = VerdictEngine([detector]).verdict(
+            self._param_set("EK3_ACC_P_NSE", 999.0))
+        self.assertEqual(verdict, VERDICT_DROP)
+        self.assertTrue(any(item["rule_id"] == "MAV-PARAM-01" for item in info["evidence"]))
+
+    def test_param_set_in_range_accepted(self):
+        detector = MavlinkDetector(
+            mode="enforce", ports=[14550], require_signed=False,
+            validate_crc=True, param_ranges={"EK3_ACC_P_NSE": (0.001, 1.0)})
+        self.assertEqual(VerdictEngine([detector]).verdict(
+            self._param_set("EK3_ACC_P_NSE", 0.2))[0], VERDICT_ACCEPT)
+
+    def test_param_violation_observe_mode_never_drops(self):
+        detector = MavlinkDetector(
+            mode="observe", ports=[14550],
+            validate_crc=True, param_ranges={"EK3_ACC_P_NSE": (0.001, 1.0)})
+        verdict, info = VerdictEngine([detector]).verdict(
+            self._param_set("EK3_ACC_P_NSE", 999.0))
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertIn("mavlink_param_out_of_range", info["reasons"][0])
+        self.assertEqual(info["score"], 0.0)
+
+    def test_command_long_profile_decodes_command_id(self):
+        payload = struct.pack("<7fHBBB", *(0.0,) * 7, 176, 1, 1, 0)
+        detector = MavlinkDetector(
+            mode="observe", ports=[14550], dangerous_commands=[176])
+        verdict, info = VerdictEngine([detector]).verdict(
+            build_udp_packet(14550, _mav2(msgid=76, payload=payload)))
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertTrue(any("mavlink_command_profile_match command=176" in reason
+                            for reason in info["reasons"]))
+
+    def test_command_long_trailing_zero_truncation_restored(self):
+        full = struct.pack("<7fHBBB", *(0.0,) * 7, 176, 1, 1, 0)
+        truncated = full.rstrip(b"\x00")
+        detector = MavlinkDetector(
+            mode="observe", ports=[14550], dangerous_commands=[176])
+        verdict, info = VerdictEngine([detector]).verdict(
+            build_udp_packet(14550, _mav2(msgid=76, payload=truncated, valid_crc=True)))
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertTrue(any("mavlink_command_profile_match command=176" in reason
+                            for reason in info["reasons"]))
+
+    def test_invalid_crc_cannot_trigger_semantic_drop(self):
+        payload = struct.pack("<fBB16sB", 999.0, 1, 1,
+                              b"EK3_ACC_P_NSE".ljust(16, b"\x00"), 9)
+        detector = MavlinkDetector(
+            mode="enforce", ports=[14550], validate_crc=True,
+            param_ranges={"EK3_ACC_P_NSE": (0.001, 1.0)})
+        verdict, info = VerdictEngine([detector]).verdict(
+            build_udp_packet(14550, _mav2(msgid=23, payload=payload, valid_crc=False)))
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertTrue(any("mavlink_crc_invalid" in reason for reason in info["reasons"]))
+
+    def test_mission_item_decodes_current_redirect(self):
+        payload = struct.pack("<7fHHBBBBB", *(0.0,) * 7, 4, 16, 1, 1, 3, 1, 1)
+        detector = MavlinkDetector(mode="observe", ports=[14550])
+        verdict, info = VerdictEngine([detector]).verdict(
+            build_udp_packet(14550, _mav2(msgid=39, payload=payload)))
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertTrue(any("mavlink_mission_current seq=4 command=16" in reason
+                            for reason in info["reasons"]))
+
 def _ccsds(seq=1, apid=42, payload=b"abc", fecf=False, corrupt=False):
     first = apid & 0x7FF
     sequence = (3 << 14) | (seq & 0x3FFF)
@@ -433,6 +510,18 @@ def _ccsds(seq=1, apid=42, payload=b"abc", fecf=False, corrupt=False):
         crc = crc16_ccitt(packet) ^ (1 if corrupt else 0)
         packet += crc.to_bytes(2, "big")
     return packet
+
+
+def _ccsds_sdls(seq=1, apid=0x123, payload=b"DISABLE", key=None,
+                counter=1, bad_mac=False):
+    packet = _ccsds(seq=seq, apid=apid, payload=payload, fecf=True)
+    if key is None:
+        return packet
+    ctr = counter.to_bytes(4, "big")
+    mac = hmac.digest(key, packet + ctr, "sha256")
+    if bad_mac:
+        mac = bytes([mac[0] ^ 1]) + mac[1:]
+    return packet + ctr + mac
 
 
 class TestCcsdsDetector(unittest.TestCase):
@@ -462,6 +551,41 @@ class TestCcsdsDetector(unittest.TestCase):
         verdict, info = e.verdict(pkt)
         self.assertEqual(verdict, VERDICT_ACCEPT)
         self.assertFalse(info["evidence"][0]["identification_verified"])
+
+    def test_sensitive_command_without_sdls_dropped(self):
+        detector = CcsdsDetector(
+            mode="enforce", ports=[5111], apids=[0x123],
+            sensitive_commands=["DISABLE"], require_sdls=True)
+        verdict, info = VerdictEngine([detector]).verdict(
+            build_udp_packet(5111, _ccsds_sdls()))
+        self.assertEqual(verdict, VERDICT_DROP)
+        self.assertTrue(any(item["rule_id"] == "CCSDS-SDLS-01"
+                            for item in info["evidence"]))
+
+    def test_sensitive_command_with_valid_sdls_accepted(self):
+        key = b"rehearsal-test-key"
+        detector = CcsdsDetector(
+            mode="enforce", ports=[5111], apids=[0x123],
+            sensitive_commands=["DISABLE"], require_sdls=True, sdls_key=key)
+        self.assertEqual(VerdictEngine([detector]).verdict(
+            build_udp_packet(5111, _ccsds_sdls(key=key)))[0], VERDICT_ACCEPT)
+
+    def test_invalid_sdls_mac_dropped(self):
+        key = b"rehearsal-test-key"
+        detector = CcsdsDetector(
+            mode="enforce", ports=[5111], apids=[0x123],
+            sensitive_commands=["DISABLE"], require_sdls=True, sdls_key=key)
+        verdict, info = VerdictEngine([detector]).verdict(
+            build_udp_packet(5111, _ccsds_sdls(key=key, bad_mac=True)))
+        self.assertEqual(verdict, VERDICT_DROP)
+        self.assertTrue(any("ccsds_sdls_mac_invalid" in reason for reason in info["reasons"]))
+
+    def test_non_sensitive_command_without_sdls_accepted(self):
+        detector = CcsdsDetector(
+            mode="enforce", ports=[5111], apids=[0x123],
+            sensitive_commands=["DISABLE"], require_sdls=True)
+        self.assertEqual(VerdictEngine([detector]).verdict(
+            build_udp_packet(5111, _ccsds_sdls(payload=b"STATUS")))[0], VERDICT_ACCEPT)
 
 
 def _rtps(guid=b"G" * 12, version=(2, 3), vendor=b"\x01\x0f", malformed=False):
