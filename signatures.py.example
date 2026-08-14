@@ -1,0 +1,46 @@
+"""샘플 시그니처 설정 — 실제 대회 룰이 아닌 엔진 사용 예제
+
+데모 취약점(SSRF/AUTH/SQLi) + 예선 dahAgent의 quorum 사상(약한 신호는 가중치로 합산)을
+반영
+실제 대회 룰은 룰 담당 작성, 엔진은 스키마 소비만 담당
+
+주의: 엔진 입력 정규화(소문자·URL decode)에 따른 소문자 기준 패턴 작성
+그대로 실행 가능한 샘플과 대회 투입 전 실제 port·정상 traffic·공격 PCAP 기반 교체 필요
+"""
+
+SIGNATURES = [
+    # 지원 필드: pattern(필수), port(선택), reason, weight, target
+    # port 생략 시 모든 목적지 port 적용
+    # --- Layer 3 (port 8084) SQLi — 강한 단일 신호 ---
+    {"port": 8084, "pattern": r"union\s+select",   "reason": "SQLi UNION",  "weight": 1.0},
+    {"port": 8084, "pattern": r"sqlite_master",     "reason": "SQLi schema", "weight": 1.0},
+
+    # --- Layer 1 (port 8082) SSRF — 강한 단일 신호 ---
+    {"port": 8082, "pattern": r"127\.0\.0\.1|/registry", "reason": "SSRF loopback", "weight": 1.0},
+
+    # --- Layer 2 (port 8083) 쿠키 role 변조 — 엔진의 base64 정규화 덕에 평문으로 잡힘 ---
+    {"port": 8083, "pattern": r'"role"\s*:\s*"admin"', "reason": "cookie role tamper", "weight": 1.0},
+
+    # --- 약한 신호 두 개(quorum 사상): 단독으론 임계 미달, 둘이 겹치면 DROP ---
+    {"port": 8082, "pattern": r"\.\./",             "reason": "path traversal", "weight": 0.5},
+    {"port": 8082, "pattern": r"/etc/passwd",       "reason": "sensitive file", "weight": 0.5},
+]
+
+# 정상/헬스 트래픽 즉시 ACCEPT (SLA 곱셈 계수 보호), 정규화본 기준
+WHITELIST = [
+    {"pattern": r"^get /health"},
+    {"pattern": r"^get / http"},
+]
+
+# 아래 선택 설정은 기본 비활성 예시
+# 실제 protocol과 정상 baseline 확인 후 필요한 항목만 주석 해제
+# PARAM_RANGES = {
+#     8085: {"gain": (0.0, 0.5, 1.0)},  # 이름: (최솟값, 최댓값, weight)
+# }
+# RATE_LIMIT = {
+#     "per_sec": 50,
+#     "window": 1.0,
+#     "weight": 1.0,
+#     "scope": "flow",  # 기본값, port 전체 합산은 정상 baseline 확인 후 사용
+#     "max_keys": 4096,  # 장시간 실행 시 보존할 flow/port 상태 상한
+# }

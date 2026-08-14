@@ -1,0 +1,24 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+*.log
+
+# 룰 담당자가 로컬/배포 환경에서 생성하는 실제 룰 파일
+signatures.py
+signatures.skeleton.py
+
+# 프로젝트 내부 설계 기록과 로컬 QA 증적
+DEFENDER_설계.md
+qa-results/
+
+# 로컬 편집기·AI 확장 지침
+.github/instructions/
+.github/copilot-instructions.md
