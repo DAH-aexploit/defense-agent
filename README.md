@@ -103,7 +103,7 @@ AGENT_SOCKET=/run/agent.sock python3 defender.py
 
 ### Docker Compose integration
 
-DAH 통합 배포 프로젝트에서는 이 저장소의 `defender.py`, `detectors.py`와 실제 `signatures.py`를 `deploy/agents/team1/defender/`에 반영한 뒤 combat profile로 실행한다.
+DAH 통합 배포 프로젝트에서는 이 저장소의 `defender.py`, `detectors.py`, `protocol_profiles.py`와 실제 `signatures.py`를 `deploy/agents/team1/defender/`에 반영한 뒤 combat profile로 실행한다.
 
 ```bash
 cd ../deploy
@@ -135,6 +135,7 @@ SIGNATURES = [
 | 필드 | 필수 | 기본값 | 의미 |
 |---|:---:|---:|---|
 | `pattern` | O | 없음 | Python 정규식 |
+| `id` | X | `SIG-TEXT` | 로그와 Evidence에 기록할 룰 식별자 |
 | `port` | X | 모든 포트 | 목적지 포트 제한 |
 | `reason` | X | `pattern` 문자열 | 로그 분류명과 독립 근거 식별자 |
 | `weight` | X | `1.0` | 탐지 근거의 가중치 |
@@ -203,17 +204,42 @@ DEF_MAVLINK_PORTS=14550
 DEF_MAVLINK_REQUIRE_SIGNED=0
 
 DEF_CCSDS_MODE=observe
-DEF_CCSDS_PORTS=10000
+DEF_CCSDS_PORTS=5111
+# DEF_CCSDS_SDLS_KEY_HEX=hex-encoded-shared-key
 
 DEF_RTPS_MODE=observe
 DEF_RTPS_PORTS=7400
 ```
 
-- **MAVLink** version, system/component ID, message ID, sequence와 signed timestamp 관찰. CRC-extra는 message 종류별 checksum 계산에 추가되는 값
-- **CCSDS** primary header, APID, sequence, packet length와 선택적 FECF 관찰. FECF는 전송 오류를 검출하는 frame checksum이며 송신자 인증 기능은 아님
+- **MAVLink** version, system/component ID, message ID, sequence, signed timestamp와 설정된 `PARAM_SET` 안전 범위 관찰. `COMMAND_LONG`과 `MISSION_ITEM` 핵심 필드 추출 포함. CRC-extra는 message 종류별 checksum 계산에 추가되는 값
+- **CCSDS** primary header, APID, sequence, packet length, 선택적 FECF와 설정된 민감 TC 명령 관찰. 예선 SDLS 프로파일 사용 시 counter replay 및 선택적 HMAC-SHA256 검증 포함. FECF는 전송 오류를 검출하는 frame checksum이며 송신자 인증 기능은 아님
 - **RTPS / DDS** protocol profile, vendor, participant GUID와 submessage boundary 관찰. participant GUID는 DDS 참여자의 식별자이고 submessage boundary는 한 메시지 안의 세부 단위 경계
 
-현재 MAVLink parser는 dialect별 CRC-extra를 검증하지 않으므로 완전한 프로토콜 인증기가 아니라 구조적 후보 식별기다. CCSDS FECF 역시 무결성 오류를 찾을 뿐 패킷 송신자를 인증하지 않는다.
+현재 MAVLink parser는 프로파일에 등록된 message ID의 CRC-X25와 CRC_EXTRA를 검증한다. 등록되지 않은 message와 본선에서 추가되는 dialect 고유 message는 CRC_EXTRA를 알 수 없으므로 의미 기반 차단 대상으로 사용하지 않는다. CCSDS FECF 역시 무결성 오류를 찾을 뿐 패킷 송신자를 인증하지 않는다.
+
+프로토콜 의미 검사는 정규식 룰과 분리된 `protocol_profiles.py`에서 설정한다. 아래 값은 예선 `dahAgent`에서 확인한 프로파일이며 본선 값으로 간주하지 않는다. 엔진은 이 파일을 실제 런타임에 읽지만 기본 모드가 `observe`이므로 명시적인 port와 `enforce` 설정 전에는 차단하지 않는다.
+
+```python
+MAVLINK_PROFILE = {
+    "validate_crc": True,
+    "param_ranges": {
+        "EK3_ACC_P_NSE": (0.001, 1.0),
+        "ATC_RAT_PIT_P": (0.0, 0.5),
+    },
+    "dangerous_commands": [176],
+}
+
+CCSDS_PROFILE = {
+    "apids": [0x123],
+    "sensitive_commands": ["DISABLE"],
+    "require_sdls": True,
+    "sdls_trailer_len": 36,
+}
+```
+
+MAVLink 안전 범위 위반은 CRC-X25와 지원 message의 CRC_EXTRA를 확인한 뒤 payload의 `param_value`와 `param_id`를 디코딩한 결과다. MAVLink 2가 생략한 payload 끝의 zero 필드는 message 정의 길이까지 복원한다. 현재 CRC_EXTRA 목록은 예선 탐지 대상인 `PARAM_SET`, `MISSION_ITEM`, `MISSION_COUNT`, `MISSION_CLEAR_ALL`, `COMMAND_INT`, `COMMAND_LONG`에 한정된다.
+
+CCSDS `require_sdls`는 민감 명령에 예선 형식의 SDLS trailer를 요구한다. `DEF_CCSDS_SDLS_KEY_HEX`가 설정된 경우에만 HMAC의 암호학적 유효성까지 검증하며, 키가 없으면 trailer 존재와 counter 순서만 검사한다.
 
 MAVLink와 CCSDS는 `enforce`로 설정해도 각각 `DEF_MAVLINK_PORTS`, `DEF_CCSDS_PORTS`의 명시적 port profile이 없으면 Evidence를 DROP 점수에 반영하지 않는다. 본선 port를 확인하기 전에는 기본 `observe`를 유지한다. RTPS는 고유 `RTPS` magic으로 구조 식별이 가능하지만 본선 초기 운영 정책은 동일하게 `observe`다.
 
@@ -255,6 +281,14 @@ docker compose logs -f team1-defender | grep DEFENDER_EVENT
 | `DEF_VERDICT_BUDGET_MS` | `50` | 패킷별 내부 판정 예산 |
 | `DEF_STREAM_WINDOW` | `32768` | flow별 TCP 연속 payload 보존 상한 |
 | `DEF_STREAM_TTL` | `5.0` | TCP window 유지시간(초) |
+| `DEF_MAVLINK_MODE` | `observe` | MAVLink detector의 `off`, `observe`, `enforce` 모드 |
+| `DEF_MAVLINK_PORTS` | 빈 값 | 쉼표로 구분한 MAVLink 목적지 포트 profile |
+| `DEF_MAVLINK_REQUIRE_SIGNED` | `0` | 중요 MAVLink message의 서명 요구 여부 |
+| `DEF_CCSDS_MODE` | `observe` | CCSDS detector의 `off`, `observe`, `enforce` 모드 |
+| `DEF_CCSDS_PORTS` | 빈 값 | 쉼표로 구분한 CCSDS 목적지 포트 profile |
+| `DEF_CCSDS_SDLS_KEY_HEX` | 빈 값 | SDLS HMAC 검증용 hex key, 코드나 Git에 저장하지 않음 |
+| `DEF_RTPS_MODE` | `observe` | RTPS detector의 `off`, `observe`, `enforce` 모드 |
+| `DEF_RTPS_PORTS` | 빈 값 | 쉼표로 구분한 RTPS 목적지 포트 profile |
 | `DEF_BG_ANALYSIS` | `0` | 백그라운드 LLM 분석 활성화 여부 |
 | `LLM_BASE_URL` | `http://litellm.lig.internal:4000` | OpenAI-compatible gateway 주소 |
 | `LLM_API_KEY` | 빈 값 | gateway 인증 key. 코드나 Git에 저장하지 않음 |
@@ -286,6 +320,7 @@ fail-open은 에이전트 장애가 전체 서비스 중단으로 이어지는 �
 ```text
 defender.py             broker runtime, verdict engine, background analyst
 detectors.py            normalization and detector plugins
+protocol_profiles.py     preliminary binary protocol policy profiles
 signatures.py.example   rule configuration example
 tests/
   test_engine.py        unit, safety and broker-contract tests

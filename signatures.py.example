@@ -45,6 +45,7 @@ WHITELIST = []
 # DEF_MAVLINK_REQUIRE_SIGNED=1
 # DEF_CCSDS_MODE=observe
 # DEF_CCSDS_PORTS=5111
+# DEF_CCSDS_SDLS_KEY_HEX=<리허설에서 키 제공 및 검증 허용 시 설정>
 # DEF_RTPS_MODE=observe
 # DEF_RTPS_PORTS=<리허설에서 확인한 포트>
 
