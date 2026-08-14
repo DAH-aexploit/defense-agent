@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import collections
+import hmac
 import re
 import struct
 import time
@@ -371,7 +372,38 @@ class MavFrame:
     signed: bool
     link_id: int | None
     sig_timestamp: int | None
+    crc_valid: bool | None
+    payload: bytes = field(repr=False)
     raw: bytes = field(repr=False)
+
+
+_MAVLINK_CRC_EXTRA = {
+    23: 168,   # PARAM_SET
+    39: 254,   # MISSION_ITEM
+    44: 221,   # MISSION_COUNT
+    45: 232,   # MISSION_CLEAR_ALL
+    75: 158,   # COMMAND_INT
+    76: 152,   # COMMAND_LONG
+}
+
+
+def mavlink_x25_crc(data: bytes, initial: int = 0xFFFF) -> int:
+    """MAVLink X.25 CRC 누산"""
+    crc = initial
+    for byte in data:
+        tmp = byte ^ (crc & 0xFF)
+        tmp ^= (tmp << 4) & 0xFF
+        crc = ((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)) & 0xFFFF
+    return crc
+
+
+def mavlink_frame_crc(version: int, header_and_payload: bytes, msgid: int) -> int | None:
+    """지원 메시지의 MAVLink checksum 계산"""
+    extra = _MAVLINK_CRC_EXTRA.get(msgid)
+    if extra is None:
+        return None
+    crc = mavlink_x25_crc(header_and_payload)
+    return mavlink_x25_crc(bytes([extra]), crc)
 
 
 def parse_mavlink_frames(data: bytes, current_tail: int | None = None,
@@ -408,9 +440,14 @@ def parse_mavlink_frames(data: bytes, current_tail: int | None = None,
                 sig_ts = int.from_bytes(data[sig_off + 1:sig_off + 7], "little")
             else:
                 link_id = sig_ts = None
+        checksum_offset = header + plen
+        expected_crc = mavlink_frame_crc(version, raw[1:header + plen], msgid)
+        wire_crc = int.from_bytes(raw[checksum_offset:checksum_offset + 2], "little")
+        crc_valid = None if expected_crc is None else expected_crc == wire_crc
         if current_tail is None or end > new_from:
+            payload = raw[header:header + plen]
             frames.append(MavFrame(version, seq, sysid, compid, msgid,
-                                   signed, link_id, sig_ts, raw))
+                                   signed, link_id, sig_ts, crc_valid, payload, raw))
         off = end
     return frames
 
@@ -425,7 +462,10 @@ class MavlinkDetector(Detector):
                  require_signed: bool = False, freshness_10us: int = 6_000_000,
                  state_ttl: float = 120.0, max_keys: int = 4096,
                  id_window: float = 10.0, max_ids: int = 32,
-                 repeat_window: float = 2.0, repeat_limit: int = 4, now=None) -> None:
+                 repeat_window: float = 2.0, repeat_limit: int = 4,
+                 validate_crc: bool = False,
+                 param_ranges: dict | None = None,
+                 dangerous_commands=None, now=None) -> None:
         self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
         self.ports = {int(p) for p in (ports or [])}
         self.weight, self.require_signed = float(weight), bool(require_signed)
@@ -433,6 +473,13 @@ class MavlinkDetector(Detector):
         self.state_ttl, self.max_keys = float(state_ttl), max(32, int(max_keys))
         self.id_window, self.max_ids = float(id_window), int(max_ids)
         self.repeat_window, self.repeat_limit = float(repeat_window), int(repeat_limit)
+        self.validate_crc = bool(validate_crc)
+        self.param_ranges = {
+            str(name): (float(spec[0]), float(spec[1]))
+            for name, spec in (param_ranges or {}).items()
+            if isinstance(spec, (tuple, list)) and len(spec) >= 2
+        }
+        self.dangerous_commands = {int(command) for command in (dangerous_commands or [])}
         self._now = now or time.monotonic
         self._seq = BoundedState(self.max_keys, self.state_ttl, self._now)
         self._sig_ts = BoundedState(self.max_keys, self.state_ttl, self._now)
@@ -454,6 +501,10 @@ class MavlinkDetector(Detector):
             "mavlink_sequence_regression": "MAV-SEQ-01",
             "mavlink_id_churn": "MAV-03",
             "mavlink_frame_repeat": "MAV-REPLAY-01",
+            "mavlink_crc_invalid": "MAV-CRC-01",
+            "mavlink_param_out_of_range": "MAV-PARAM-01",
+            "mavlink_command_profile_match": "MAV-CMD-01",
+            "mavlink_mission_current": "MAV-MISSION-01",
         }.get(family, "MAV-OBS")
         enabled = self.mode == "enforce" and actionable
         return Evidence(
@@ -461,6 +512,48 @@ class MavlinkDetector(Detector):
             EvidenceClass.CONTEXT_REQUIRED if enabled else EvidenceClass.OBSERVATION_ONLY,
             IdentificationBasis.PROFILE_BOUND,
             bool(self.ports), enabled, True)
+
+    @staticmethod
+    def _payload(frame: MavFrame, size: int) -> bytes | None:
+        """MAVLink 2 trailing-zero truncation 복원과 MAVLink 1 엄격 길이 확인"""
+        if len(frame.payload) >= size:
+            return frame.payload
+        if frame.version == 2:
+            return frame.payload.ljust(size, b"\x00")
+        return None
+
+    @staticmethod
+    def _param_set(frame: MavFrame):
+        """MAVLink common.xml PARAM_SET wire 필드 추출"""
+        payload = MavlinkDetector._payload(frame, 23)
+        if frame.msgid != 23 or payload is None:
+            return None
+        value, target_system, target_component, raw_name, param_type = struct.unpack_from(
+            "<fBB16sB", payload)
+        name = raw_name.split(b"\x00", 1)[0].decode("ascii", "ignore")
+        return name, value, target_system, target_component, param_type
+
+    @staticmethod
+    def _command_long(frame: MavFrame):
+        """MAVLink common.xml COMMAND_LONG wire 필드 추출"""
+        payload = MavlinkDetector._payload(frame, 33)
+        if frame.msgid != 76 or payload is None:
+            return None
+        values = struct.unpack_from("<7fHBBB", payload)
+        return values[7], values[:7], values[8], values[9], values[10]
+
+    @staticmethod
+    def _mission_item(frame: MavFrame):
+        """MAVLink common.xml MISSION_ITEM wire 핵심 필드 추출"""
+        payload = MavlinkDetector._payload(frame, 37)
+        if frame.msgid != 39 or payload is None:
+            return None
+        values = struct.unpack_from("<7fHHBBBBB", payload)
+        return {
+            "seq": values[7], "command": values[8], "target_system": values[9],
+            "target_component": values[10], "frame": values[11],
+            "current": values[12], "autocontinue": values[13],
+        }
 
     def inspect(self, ctx: PacketContext) -> list[Evidence]:
         if self.mode == "off" or (self.ports and ctx.dport not in self.ports):
@@ -473,6 +566,10 @@ class MavlinkDetector(Detector):
         now, hits = self._now(), []
         flow = ctx.flow or (ctx.proto, ctx.dport)
         for frame in frames:
+            if self.validate_crc and frame.crc_valid is False:
+                hits.append(self._hit(
+                    f"mavlink_crc_invalid msgid={frame.msgid}", actionable=False))
+                continue
             seq_key = (flow, frame.sysid, frame.compid)
             previous = self._seq.get(seq_key, None, now)
             if previous is not None:
@@ -496,6 +593,27 @@ class MavlinkDetector(Detector):
                 self._max_ts.put(max_key, max(maximum or 0, frame.sig_timestamp), now)
             elif self.require_signed and frame.msgid in self._SENSITIVE_MSGIDS:
                 hits.append(self._hit(f"mavlink_unsigned_sensitive msgid={frame.msgid}"))
+
+            param = self._param_set(frame)
+            if param is not None:
+                name, value, _target_system, _target_component, _param_type = param
+                limits = self.param_ranges.get(name)
+                if limits is not None and not (limits[0] <= value <= limits[1]):
+                    hits.append(self._hit(
+                        f"mavlink_param_out_of_range name={name} value={value:g} "
+                        f"range=[{limits[0]:g},{limits[1]:g}]"))
+
+            command = self._command_long(frame)
+            if command is not None and command[0] in self.dangerous_commands:
+                hits.append(self._hit(
+                    f"mavlink_command_profile_match command={command[0]}",
+                    actionable=self.require_signed and not frame.signed))
+
+            mission = self._mission_item(frame)
+            if mission is not None and mission["current"]:
+                hits.append(self._hit(
+                    f"mavlink_mission_current seq={mission['seq']} command={mission['command']}",
+                    actionable=self.require_signed and not frame.signed))
 
             ids = self._ids.get(flow, None, now) or collections.deque()
             ids.append((now, (frame.sysid, frame.compid)))
@@ -528,6 +646,7 @@ class CcsdsPacket:
     payload: bytes = field(repr=False)
     has_fecf: bool = False
     fecf_valid: bool | None = None
+    sdls_trailer: bytes = field(default=b"", repr=False)
     raw: bytes = field(default=b"", repr=False)
 
 
@@ -540,7 +659,7 @@ def crc16_ccitt(data: bytes, initial: int = 0xFFFF) -> int:
     return crc
 
 
-def parse_ccsds_packet(data: bytes) -> CcsdsPacket | None:
+def parse_ccsds_packet(data: bytes, sdls_trailer_len: int = 36) -> CcsdsPacket | None:
     """엄격한 길이 일치 기반 CCSDS Space Packet primary header 후보 파싱
 
     끝 2byte 추가 시에만 FECF(CRC-16/CCITT) 후보 처리
@@ -552,15 +671,18 @@ def parse_ccsds_packet(data: bytes) -> CcsdsPacket | None:
     if ((first >> 13) & 0x07) != 0:
         return None
     packet_end = 6 + length_field + 1
-    if packet_end < 7 or len(data) not in (packet_end, packet_end + 2):
+    tails = (0, 2, 2 + max(0, int(sdls_trailer_len)))
+    remaining = len(data) - packet_end
+    if packet_end < 7 or remaining not in tails:
         return None
-    has_fecf = len(data) == packet_end + 2
+    has_fecf = remaining >= 2
     valid = None
     if has_fecf:
-        valid = crc16_ccitt(data[:packet_end]) == int.from_bytes(data[packet_end:], "big")
+        valid = crc16_ccitt(data[:packet_end]) == int.from_bytes(data[packet_end:packet_end + 2], "big")
+    trailer = data[packet_end + 2:] if remaining > 2 else b""
     return CcsdsPacket((first >> 12) & 1, bool((first >> 11) & 1), first & 0x7FF,
                        (sequence >> 14) & 3, sequence & 0x3FFF, data[6:packet_end],
-                       has_fecf, valid, data)
+                       has_fecf, valid, trailer, data)
 
 
 class CcsdsDetector(Detector):
@@ -569,13 +691,21 @@ class CcsdsDetector(Detector):
     name = "ccsds"
 
     def __init__(self, mode="observe", ports=None, weight=1.0, max_keys=4096,
-                 state_ttl=120.0, confirmations=2, confirm_window=3.0, now=None) -> None:
+                 state_ttl=120.0, confirmations=2, confirm_window=3.0,
+                 apids=None, sensitive_commands=None, require_sdls=False,
+                 sdls_trailer_len=36, sdls_key: bytes | None = None, now=None) -> None:
         self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
         self.ports = {int(p) for p in (ports or [])}
         self.weight, self.max_keys, self.state_ttl = float(weight), max(32, int(max_keys)), float(state_ttl)
         self._now = now or time.monotonic
         self._seq = BoundedState(self.max_keys, self.state_ttl, self._now)
         self._debounce = EvidenceDebouncer(confirmations, confirm_window, self.max_keys)
+        self.apids = {int(apid) for apid in (apids or [])}
+        self.sensitive_commands = {str(command).upper() for command in (sensitive_commands or [])}
+        self.require_sdls = bool(require_sdls)
+        self.sdls_trailer_len = max(0, int(sdls_trailer_len))
+        self.sdls_key = sdls_key
+        self._sdls_counter = BoundedState(self.max_keys, self.state_ttl, self._now)
 
     @property
     def rule_count(self):
@@ -584,7 +714,9 @@ class CcsdsDetector(Detector):
     def _hit(self, reason, actionable=True):
         family = reason.split(" ", 1)[0]
         rule_id = ("CCSDS-FECF-01" if family == "ccsds_fecf_invalid" else
-                   "CCSDS-02" if family.startswith("ccsds_sequence_") else "CCSDS-OBS")
+                   "CCSDS-02" if family.startswith("ccsds_sequence_") else
+                   "CCSDS-SDLS-01" if family.startswith("ccsds_sdls_") else
+                   "CCSDS-CMD-01" if family == "ccsds_sensitive_command" else "CCSDS-OBS")
         enabled = self.mode == "enforce" and actionable
         return Evidence(
             self.weight if enabled else 0.0, reason, f"ccsds:{family}", rule_id,
@@ -595,8 +727,10 @@ class CcsdsDetector(Detector):
     def inspect(self, ctx):
         if self.mode == "off" or (self.ports and ctx.dport not in self.ports):
             return []
-        packet = parse_ccsds_packet(ctx.segment_payload or ctx.payload)
+        packet = parse_ccsds_packet(ctx.segment_payload or ctx.payload, self.sdls_trailer_len)
         if packet is None:
+            return []
+        if self.apids and packet.apid not in self.apids:
             return []
         now, hits = self._now(), []
         flow = ctx.flow or (ctx.proto, ctx.dport)
@@ -614,6 +748,29 @@ class CcsdsDetector(Detector):
         self._seq.put(key, packet.sequence_count, now)
         if packet.has_fecf and packet.fecf_valid is False:
             hits.append(self._hit(f"ccsds_fecf_invalid apid={packet.apid}"))
+        command = packet.payload.rstrip(b"\x00").decode("ascii", "ignore").strip().upper()
+        sensitive = command in self.sensitive_commands
+        if sensitive:
+            hits.append(self._hit(
+                f"ccsds_sensitive_command apid={packet.apid} command={command}",
+                actionable=False))
+        if self.require_sdls and sensitive and not packet.sdls_trailer:
+            hits.append(self._hit(
+                f"ccsds_sdls_missing apid={packet.apid} command={command}"))
+        if packet.sdls_trailer and len(packet.sdls_trailer) >= 4:
+            counter = int.from_bytes(packet.sdls_trailer[:4], "big")
+            counter_key = (flow, packet.apid)
+            old_counter = self._sdls_counter.get(counter_key, None, now)
+            if old_counter is not None and counter <= old_counter:
+                hits.append(self._hit(
+                    f"ccsds_sdls_counter_replay apid={packet.apid} counter={counter}"))
+            self._sdls_counter.put(counter_key, max(old_counter or 0, counter), now)
+            if self.sdls_key is not None and len(packet.sdls_trailer) == 36:
+                frame_end = len(packet.raw) - len(packet.sdls_trailer)
+                expected = hmac.digest(
+                    self.sdls_key, packet.raw[:frame_end] + packet.sdls_trailer[:4], "sha256")
+                if not hmac.compare_digest(expected, packet.sdls_trailer[4:]):
+                    hits.append(self._hit(f"ccsds_sdls_mac_invalid apid={packet.apid}"))
         return hits
 
 

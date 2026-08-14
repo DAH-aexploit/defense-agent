@@ -39,6 +39,10 @@ from detectors import (CcsdsDetector, Evidence, EvidenceClass, IdentificationBas
                        MavlinkDetector, PacketContext,
                        ParamRangeDetector, RequestBurstDetector, RtpsDetector,
                        SignatureDetector)
+try:
+    from protocol_profiles import CCSDS_PROFILE, MAVLINK_PROFILE
+except ImportError:
+    CCSDS_PROFILE, MAVLINK_PROFILE = {}, {}
 
 
 def _env_number(name, default, cast, minimum):
@@ -99,6 +103,11 @@ def _env_ports(name: str) -> list[int]:
 
 CCSDS_PORTS = _env_ports("DEF_CCSDS_PORTS")
 RTPS_PORTS = _env_ports("DEF_RTPS_PORTS")
+try:
+    CCSDS_SDLS_KEY = bytes.fromhex(os.environ.get("DEF_CCSDS_SDLS_KEY_HEX", "")) or None
+except ValueError:
+    CCSDS_SDLS_KEY = None
+    logging.warning("invalid DEF_CCSDS_SDLS_KEY_HEX; SDLS MAC verification disabled")
 
 # ── 프로토콜 상수 (broker 계약) ─────────────────────────────────────────────
 MSG_PACKET = 0x01
@@ -528,9 +537,18 @@ def load_engine() -> VerdictEngine:
     # 프로토콜 미확정 단계의 내장 상태형 관찰기, 기본 observe(weight=0)로 DROP 제외
     if MAVLINK_MODE != "off":
         extra.append(MavlinkDetector(mode=MAVLINK_MODE, ports=MAVLINK_PORTS,
-                                     require_signed=MAVLINK_REQUIRE_SIGNED))
+                                     require_signed=MAVLINK_REQUIRE_SIGNED,
+                                     validate_crc=MAVLINK_PROFILE.get("validate_crc", False),
+                                     param_ranges=MAVLINK_PROFILE.get("param_ranges"),
+                                     dangerous_commands=MAVLINK_PROFILE.get("dangerous_commands")))
     if CCSDS_MODE != "off":
-        extra.append(CcsdsDetector(mode=CCSDS_MODE, ports=CCSDS_PORTS))
+        extra.append(CcsdsDetector(
+            mode=CCSDS_MODE, ports=CCSDS_PORTS,
+            apids=CCSDS_PROFILE.get("apids"),
+            sensitive_commands=CCSDS_PROFILE.get("sensitive_commands"),
+            require_sdls=CCSDS_PROFILE.get("require_sdls", False),
+            sdls_trailer_len=CCSDS_PROFILE.get("sdls_trailer_len", 36),
+            sdls_key=CCSDS_SDLS_KEY))
     if RTPS_MODE != "off":
         extra.append(RtpsDetector(mode=RTPS_MODE, ports=RTPS_PORTS))
     return VerdictEngine.from_config(sigs, wl, extra_detectors=extra)
