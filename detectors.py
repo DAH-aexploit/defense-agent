@@ -7,7 +7,7 @@
 내장 검사기:
   - SignatureDetector : 텍스트(HTTP 등) 정규식 시그니처, 정규화(URL/base64/SQL주석) 포함
   - ParamRangeDetector: 제어 파라미터 안전범위 이탈 → hit, dahAgent PARAM_SET의 HTTP 버전
-  - RateDetector     : flow별 요청 rate 급증 → hit, 정상 baseline 확인 후에만 port 전체로 확장
+  - RequestBurstDetector: flow별 packet activity 급증 관찰, 정상 baseline 확인 후 활성화
   - MavlinkDetector  : MAVLink 1/2 구조·sequence·signed timestamp·ID/replay 상태 관찰
   - CcsdsDetector    : CCSDS Space Packet header·sequence·선택적 FECF 상태 관찰
   - RtpsDetector     : RTPS header·submessage 경계·profile·participant GUID 변화 관찰
@@ -24,6 +24,7 @@ import time
 import urllib.parse
 import zlib
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 # 정규화용 정규식 (텍스트 검사기 전용)
 _SQL_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
@@ -78,6 +79,8 @@ class PacketContext:
     flow: tuple | None = None
     ip_version: int = 4
     segment_payload: bytes | None = None
+    transport_seq: int | None = None
+    transport_flags: int = 0
     _raw: str | None = field(default=None, repr=False)
     _norm: str | None = field(default=None, repr=False)
 
@@ -94,20 +97,112 @@ class PacketContext:
         return self._norm
 
 
+class EvidenceClass(StrEnum):
+    """탐지 근거만으로 확정 가능한 판정 수준"""
+
+    ATTACK_PATTERN_CONFIRMED = "attack_pattern_confirmed"
+    VIOLATION_CONFIRMED = "violation_confirmed"
+    CONTEXT_REQUIRED = "context_required"
+    OBSERVATION_ONLY = "observation_only"
+
+
+class IdentificationBasis(StrEnum):
+    """프로토콜 식별에 필요한 최소 근거"""
+
+    STRUCTURE_VERIFIED = "structure_verified"
+    PROFILE_BOUND = "profile_bound"
+    SCHEMA_DEPENDENT = "schema_dependent"
+
+
 @dataclass
-class Hit:
+class Evidence:
+    """detector가 반환하는 구조화된 탐지 근거"""
+
     weight: float
     reason: str
     # 같은 근거가 여러 번 보였다고 독립 근거 여러 개로 오인해 합산하지 않도록 하는 키
     source: str = ""
+    rule_id: str = ""
+    evidence_class: EvidenceClass = EvidenceClass.CONTEXT_REQUIRED
+    identification_basis: IdentificationBasis = IdentificationBasis.PROFILE_BOUND
+    identification_verified: bool = True
+    prerequisites_satisfied: bool = True
+    packet_complete: bool = True
+
+    @property
+    def drop_eligible(self) -> bool:
+        """현재 근거의 DROP 점수 반영 가능 여부"""
+        if not self.identification_verified:
+            return False
+        if self.evidence_class is EvidenceClass.OBSERVATION_ONLY:
+            return False
+        if self.evidence_class is EvidenceClass.VIOLATION_CONFIRMED:
+            return self.packet_complete
+        if self.evidence_class is EvidenceClass.CONTEXT_REQUIRED:
+            return self.prerequisites_satisfied
+        return self.prerequisites_satisfied
+
+
+# 기존 detector와 외부 테스트의 positional 생성 방식 호환
+Hit = Evidence
+
+
+class BoundedState:
+    """TTL과 key 상한을 공통 적용하는 LRU 상태 저장소"""
+
+    def __init__(self, max_keys=4096, ttl=120.0, now=None):
+        self.max_keys = max(1, int(max_keys))
+        self.ttl = max(0.001, float(ttl))
+        self._now = now or time.monotonic
+        self._data: collections.OrderedDict = collections.OrderedDict()
+
+    def _expire(self, now):
+        cutoff = now - self.ttl
+        while self._data:
+            key = next(iter(self._data))
+            if self._data[key][0] >= cutoff:
+                break
+            self._data.popitem(last=False)
+
+    def get(self, key, default=None, now=None):
+        current = self._now() if now is None else now
+        self._expire(current)
+        item = self._data.get(key)
+        if item is None:
+            return default
+        self._data[key] = (current, item[1])
+        self._data.move_to_end(key)
+        return item[1]
+
+    def put(self, key, value, now=None):
+        current = self._now() if now is None else now
+        self._expire(current)
+        self._data[key] = (current, value)
+        self._data.move_to_end(key)
+        while len(self._data) > self.max_keys:
+            self._data.popitem(last=False)
+        return value
+
+    def get_or_create(self, key, factory, now=None):
+        current = self._now() if now is None else now
+        value = self.get(key, None, current)
+        if value is None:
+            value = factory()
+        return self.put(key, value, current)
+
+    def discard(self, key):
+        self._data.pop(key, None)
+
+    def __len__(self):
+        return len(self._data)
 
 
 class Detector:
-    """검사기 base, inspect(ctx) 기반 Hit 목록 반환과 내부 예외 처리"""
+    """inspect(ctx) 기반 Evidence 목록 반환용 검사기 base"""
 
     name = "base"
 
-    def inspect(self, ctx: PacketContext) -> list[Hit]:  # noqa: ARG002
+    def inspect(self, ctx: PacketContext) -> list[Evidence]:  # noqa: ARG002
         return []
 
 
@@ -117,16 +212,14 @@ class EvidenceDebouncer:
     def __init__(self, confirmations=2, window=3.0, max_keys=4096):
         self.confirmations, self.window = max(1, int(confirmations)), float(window)
         self.max_keys = max(32, int(max_keys))
-        self._seen: collections.OrderedDict = collections.OrderedDict()
+        self._seen = BoundedState(self.max_keys, max(self.window * 2, 1.0))
 
     def confirmed(self, key, now):
-        q = self._seen.setdefault(key, collections.deque())
+        q = self._seen.get(key, None, now) or collections.deque()
         q.append(now)
         while q and q[0] < now - self.window:
             q.popleft()
-        self._seen.move_to_end(key)
-        while len(self._seen) > self.max_keys:
-            self._seen.popitem(last=False)
+        self._seen.put(key, q, now)
         return len(q) >= self.confirmations
 
 
@@ -164,21 +257,26 @@ class SignatureDetector(Detector):
         return {"rx": re.compile(pattern),
                 "reason": str(sig.get("reason", "")),
                 "weight": float(sig.get("weight", 1.0)),
+                "rule_id": str(sig.get("id") or sig.get("rule_id") or "SIG-TEXT"),
                 "target": str(sig.get("target", "both")).lower()}
 
     @property
     def rule_count(self) -> int:
         return sum(len(v) for v in self._by_port.values()) + len(self._any)
 
-    def inspect(self, ctx: PacketContext) -> list[Hit]:
-        hits: list[Hit] = []
+    def inspect(self, ctx: PacketContext) -> list[Evidence]:
+        hits: list[Evidence] = []
         for entry in self._by_port.get(ctx.dport, []) + self._any:
             rx, target = entry["rx"], entry["target"]
             matched = ((target in ("norm", "both") and rx.search(ctx.norm))
                        or (target in ("raw", "both") and rx.search(ctx.raw)))
             if matched:
                 reason = entry["reason"] or rx.pattern
-                hits.append(Hit(entry["weight"], reason, f"signature:{reason}"))
+                hits.append(Evidence(
+                    entry["weight"], reason, f"signature:{reason}", entry["rule_id"],
+                    EvidenceClass.ATTACK_PATTERN_CONFIRMED,
+                    IdentificationBasis.PROFILE_BOUND,
+                    True, True, True))
         return hits
 
 
@@ -196,11 +294,11 @@ class ParamRangeDetector(Detector):
     def __init__(self, rules: dict | None = None) -> None:
         self.rules = rules or {}
 
-    def inspect(self, ctx: PacketContext) -> list[Hit]:
+    def inspect(self, ctx: PacketContext) -> list[Evidence]:
         port_rules = self.rules.get(ctx.dport)
         if not port_rules:
             return []
-        hits: list[Hit] = []
+        hits: list[Evidence] = []
         for pm, val in _KV_RE.findall(ctx.raw.lower()):
             spec = port_rules.get(pm)
             if not spec:
@@ -211,22 +309,24 @@ class ParamRangeDetector(Detector):
             except (TypeError, ValueError):
                 continue
             if not (lo <= v <= hi):
-                hits.append(Hit(weight, f"{pm}={v} out of [{lo},{hi}]", f"param:{pm}"))
+                hits.append(Evidence(
+                    weight, f"{pm}={v} out of [{lo},{hi}]", f"param:{pm}",
+                    f"PARAM:{pm}", EvidenceClass.VIOLATION_CONFIRMED,
+                    IdentificationBasis.PROFILE_BOUND, True, True, True))
         return hits
 
 
-# 3) rate 이상 (대량 명령 / mass-push, 기본 flow 단위·선택적 port 전체)
-class RateDetector(Detector):
-    """
-    기본 flow별 요청 rate가 임계를 넘으면 hit
-    상태 기반(단일 verdict 스레드에서만 호출)
+# 3) packet activity burst 관찰, 기본 flow 단위·선택적 port 전체
+class RequestBurstDetector(Detector):
+    """flow별 packet activity 임계 초과 Evidence
 
-    여러 정상 송신자 요청 합산 오탐 방지를 위한 기본 flow scope
-    실제 정상 burst baseline 확인 후에만 destination port 전체 합산 scope="port" 사용
-    테스트 결정성을 위한 now() 주입 지원, 실사용 time.monotonic
+    단일 verdict thread용 상태 기반 검사기
+    다수 정상 송신자 합산 오탐 방지용 기본 flow scope
+    정상 baseline 확인 후에만 사용할 destination port 합산 scope
+    테스트 결정성 확보용 now() 주입과 실사용 time.monotonic
     """
 
-    name = "rate"
+    name = "request_burst"
 
     def __init__(self, per_sec: float = 50.0, window: float = 1.0,
                  weight: float = 1.0, now=None, scope: str = "flow",
@@ -237,24 +337,28 @@ class RateDetector(Detector):
         self.scope = scope if scope in ("flow", "port") else "flow"
         self.max_keys = max(16, int(max_keys))
         self._now = now or time.monotonic
-        self._hits: dict[object, list[float]] = {}
+        self._hits = BoundedState(self.max_keys, max(self.window * 2, 1.0), self._now)
 
-    def inspect(self, ctx: PacketContext) -> list[Hit]:
+    def inspect(self, ctx: PacketContext) -> list[Evidence]:
         t = self._now()
         key = ctx.dport if self.scope == "port" or not ctx.flow else ctx.flow
-        if key not in self._hits and len(self._hits) >= self.max_keys:
-            # 장시간 실행의 무제한 메모리 증가 방지를 위한 오래된 빈·저활성 key 우선 제한
-            oldest = min(self._hits, key=lambda k: self._hits[k][-1] if self._hits[k] else -1)
-            self._hits.pop(oldest, None)
-        q = self._hits.setdefault(key, [])
+        q = self._hits.get(key, None, t) or []
         q.append(t)
         cutoff = t - self.window
         while q and q[0] < cutoff:
             q.pop(0)
+        self._hits.put(key, q, t)
         if len(q) > self.per_sec * self.window:
-            return [Hit(self.weight, f"rate {len(q)}/{self.window}s on :{ctx.dport} ({self.scope})",
-                        f"rate:{self.scope}:{ctx.dport}")]
+            return [Evidence(
+                self.weight, f"rate {len(q)}/{self.window}s on :{ctx.dport} ({self.scope})",
+                f"request_burst:{self.scope}:{ctx.dport}", "BURST-01",
+                EvidenceClass.CONTEXT_REQUIRED, IdentificationBasis.PROFILE_BOUND,
+                True, True, True)]
         return []
+
+
+# 기존 외부 구성과 import 경로 호환용 별칭
+RateDetector = RequestBurstDetector
 
 
 @dataclass(frozen=True)
@@ -330,45 +434,35 @@ class MavlinkDetector(Detector):
         self.id_window, self.max_ids = float(id_window), int(max_ids)
         self.repeat_window, self.repeat_limit = float(repeat_window), int(repeat_limit)
         self._now = now or time.monotonic
-        self._seq: collections.OrderedDict = collections.OrderedDict()
-        self._sig_ts: collections.OrderedDict = collections.OrderedDict()
-        self._max_ts: collections.OrderedDict = collections.OrderedDict()
-        self._ids: dict[object, collections.deque] = {}
-        self._repeat: dict[object, collections.deque] = {}
+        self._seq = BoundedState(self.max_keys, self.state_ttl, self._now)
+        self._sig_ts = BoundedState(self.max_keys, self.state_ttl, self._now)
+        self._max_ts = BoundedState(self.max_keys, self.state_ttl, self._now)
+        self._ids = BoundedState(self.max_keys, self.state_ttl, self._now)
+        self._repeat = BoundedState(self.max_keys, self.state_ttl, self._now)
 
     @property
     def rule_count(self) -> int:
         return 0 if self.mode == "off" else 1
 
-    def _hit(self, reason: str, actionable: bool = True) -> Hit:
+    def _hit(self, reason: str, actionable: bool = True) -> Evidence:
         family = reason.split(" ", 1)[0]
-        return Hit(self.weight if self.mode == "enforce" and actionable else 0.0,
-                   reason, f"mavlink:{family}")
+        rule_id = {
+            "mavlink_signature_replay": "MAV-02",
+            "mavlink_signature_stale": "MAV-02",
+            "mavlink_unsigned_sensitive": "MAV-02",
+            "mavlink_sequence_duplicate": "MAV-SEQ-01",
+            "mavlink_sequence_regression": "MAV-SEQ-01",
+            "mavlink_id_churn": "MAV-03",
+            "mavlink_frame_repeat": "MAV-REPLAY-01",
+        }.get(family, "MAV-OBS")
+        enabled = self.mode == "enforce" and actionable
+        return Evidence(
+            self.weight if enabled else 0.0, reason, f"mavlink:{family}", rule_id,
+            EvidenceClass.CONTEXT_REQUIRED if enabled else EvidenceClass.OBSERVATION_ONLY,
+            IdentificationBasis.PROFILE_BOUND,
+            bool(self.ports), enabled, True)
 
-    def _put(self, store: collections.OrderedDict, key, value) -> None:
-        store[key] = value
-        store.move_to_end(key)
-        while len(store) > self.max_keys:
-            store.popitem(last=False)
-
-    def _expire(self, now: float) -> None:
-        cutoff = now - self.state_ttl
-        for store in (self._seq, self._sig_ts, self._max_ts):
-            while store:
-                key = next(iter(store))
-                if store[key][0] >= cutoff:
-                    break
-                store.popitem(last=False)
-        for mapping in (self._ids, self._repeat):
-            for key in [k for k, q in mapping.items() if not q or q[-1][0] < cutoff]:
-                mapping.pop(key, None)
-
-    def _bound_mapping(self, mapping: dict) -> None:
-        while len(mapping) > self.max_keys:
-            oldest = min(mapping, key=lambda k: mapping[k][-1][0] if mapping[k] else -1)
-            mapping.pop(oldest, None)
-
-    def inspect(self, ctx: PacketContext) -> list[Hit]:
+    def inspect(self, ctx: PacketContext) -> list[Evidence]:
         if self.mode == "off" or (self.ports and ctx.dport not in self.ports):
             return []
         segment = ctx.segment_payload if ctx.segment_payload is not None else ctx.payload
@@ -377,48 +471,47 @@ class MavlinkDetector(Detector):
         if not frames:
             return []
         now, hits = self._now(), []
-        self._expire(now)
         flow = ctx.flow or (ctx.proto, ctx.dport)
         for frame in frames:
             seq_key = (flow, frame.sysid, frame.compid)
-            previous = self._seq.get(seq_key)
+            previous = self._seq.get(seq_key, None, now)
             if previous is not None:
-                delta = (frame.seq - previous[1]) & 0xFF
+                delta = (frame.seq - previous) & 0xFF
                 if delta == 0:
                     hits.append(self._hit(f"mavlink_sequence_duplicate sys={frame.sysid} comp={frame.compid}"))
                 elif delta > 128:
-                    hits.append(self._hit(f"mavlink_sequence_regression last={previous[1]} current={frame.seq}"))
-            self._put(self._seq, seq_key, (now, frame.seq))
+                    hits.append(self._hit(f"mavlink_sequence_regression last={previous} current={frame.seq}"))
+            self._seq.put(seq_key, frame.seq, now)
 
             if frame.signed and frame.sig_timestamp is not None:
                 sig_key = (flow, frame.link_id, frame.sysid, frame.compid)
-                last = self._sig_ts.get(sig_key)
-                if last is not None and frame.sig_timestamp <= last[1]:
-                    hits.append(self._hit(f"mavlink_signature_replay ts={frame.sig_timestamp} last={last[1]}"))
+                last = self._sig_ts.get(sig_key, None, now)
+                if last is not None and frame.sig_timestamp <= last:
+                    hits.append(self._hit(f"mavlink_signature_replay ts={frame.sig_timestamp} last={last}"))
                 max_key = (flow, frame.link_id)
-                maximum = self._max_ts.get(max_key)
-                if maximum is not None and maximum[1] - frame.sig_timestamp > self.freshness_10us:
-                    hits.append(self._hit(f"mavlink_signature_stale ts={frame.sig_timestamp} max={maximum[1]}"))
-                self._put(self._sig_ts, sig_key, (now, max(last[1] if last else 0, frame.sig_timestamp)))
-                self._put(self._max_ts, max_key, (now, max(maximum[1] if maximum else 0,
-                                                            frame.sig_timestamp)))
+                maximum = self._max_ts.get(max_key, None, now)
+                if maximum is not None and maximum - frame.sig_timestamp > self.freshness_10us:
+                    hits.append(self._hit(f"mavlink_signature_stale ts={frame.sig_timestamp} max={maximum}"))
+                self._sig_ts.put(sig_key, max(last or 0, frame.sig_timestamp), now)
+                self._max_ts.put(max_key, max(maximum or 0, frame.sig_timestamp), now)
             elif self.require_signed and frame.msgid in self._SENSITIVE_MSGIDS:
                 hits.append(self._hit(f"mavlink_unsigned_sensitive msgid={frame.msgid}"))
 
-            ids = self._ids.setdefault(flow, collections.deque())
+            ids = self._ids.get(flow, None, now) or collections.deque()
             ids.append((now, (frame.sysid, frame.compid)))
-            self._bound_mapping(self._ids)
             while ids and ids[0][0] < now - self.id_window:
                 ids.popleft()
+            self._ids.put(flow, ids, now)
             if len({item[1] for item in ids}) > self.max_ids:
                 hits.append(self._hit(f"mavlink_id_churn unique>{self.max_ids}"))
 
             fp = zlib.crc32(frame.raw)
-            repeats = self._repeat.setdefault((flow, fp), collections.deque())
+            repeat_key = (flow, fp)
+            repeats = self._repeat.get(repeat_key, None, now) or collections.deque()
             repeats.append((now, frame.seq))
-            self._bound_mapping(self._repeat)
             while repeats and repeats[0][0] < now - self.repeat_window:
                 repeats.popleft()
+            self._repeat.put(repeat_key, repeats, now)
             if len(repeats) > self.repeat_limit:
                 hits.append(self._hit(f"mavlink_frame_repeat count={len(repeats)} msgid={frame.msgid}"))
         return hits
@@ -481,7 +574,7 @@ class CcsdsDetector(Detector):
         self.ports = {int(p) for p in (ports or [])}
         self.weight, self.max_keys, self.state_ttl = float(weight), max(32, int(max_keys)), float(state_ttl)
         self._now = now or time.monotonic
-        self._seq: collections.OrderedDict = collections.OrderedDict()
+        self._seq = BoundedState(self.max_keys, self.state_ttl, self._now)
         self._debounce = EvidenceDebouncer(confirmations, confirm_window, self.max_keys)
 
     @property
@@ -490,8 +583,14 @@ class CcsdsDetector(Detector):
 
     def _hit(self, reason, actionable=True):
         family = reason.split(" ", 1)[0]
-        return Hit(self.weight if self.mode == "enforce" and actionable else 0.0,
-                   reason, f"ccsds:{family}")
+        rule_id = ("CCSDS-FECF-01" if family == "ccsds_fecf_invalid" else
+                   "CCSDS-02" if family.startswith("ccsds_sequence_") else "CCSDS-OBS")
+        enabled = self.mode == "enforce" and actionable
+        return Evidence(
+            self.weight if enabled else 0.0, reason, f"ccsds:{family}", rule_id,
+            EvidenceClass.CONTEXT_REQUIRED if enabled else EvidenceClass.OBSERVATION_ONLY,
+            IdentificationBasis.PROFILE_BOUND,
+            bool(self.ports), enabled, True)
 
     def inspect(self, ctx):
         if self.mode == "off" or (self.ports and ctx.dport not in self.ports):
@@ -502,20 +601,17 @@ class CcsdsDetector(Detector):
         now, hits = self._now(), []
         flow = ctx.flow or (ctx.proto, ctx.dport)
         key = (flow, packet.apid, packet.packet_type)
-        old = self._seq.get(key)
-        if old and now - old[0] <= self.state_ttl:
-            delta = (packet.sequence_count - old[1]) & 0x3FFF
+        old = self._seq.get(key, None, now)
+        if old is not None:
+            delta = (packet.sequence_count - old) & 0x3FFF
             if delta == 0:
                 confirmed = self._debounce.confirmed((key, "duplicate"), now)
                 hits.append(self._hit(f"ccsds_sequence_duplicate apid={packet.apid}", confirmed))
             elif delta > 0x2000:
                 confirmed = self._debounce.confirmed((key, "regression"), now)
                 hits.append(self._hit(
-                    f"ccsds_sequence_regression last={old[1]} current={packet.sequence_count}", confirmed))
-        self._seq[key] = (now, packet.sequence_count)
-        self._seq.move_to_end(key)
-        while len(self._seq) > self.max_keys:
-            self._seq.popitem(last=False)
+                    f"ccsds_sequence_regression last={old} current={packet.sequence_count}", confirmed))
+        self._seq.put(key, packet.sequence_count, now)
         if packet.has_fecf and packet.fecf_valid is False:
             hits.append(self._hit(f"ccsds_fecf_invalid apid={packet.apid}"))
         return hits
@@ -564,8 +660,9 @@ class RtpsDetector(Detector):
         self.weight, self.guid_window = float(weight), float(guid_window)
         self.max_guids, self.max_keys = int(max_guids), max(32, int(max_keys))
         self._now = now or time.monotonic
-        self._guids: dict[object, collections.deque] = {}
-        self._profile: collections.OrderedDict = collections.OrderedDict()
+        ttl = max(self.guid_window * 2, 1.0)
+        self._guids = BoundedState(self.max_keys, ttl, self._now)
+        self._profile = BoundedState(self.max_keys, ttl, self._now)
 
     @property
     def rule_count(self):
@@ -573,8 +670,17 @@ class RtpsDetector(Detector):
 
     def _hit(self, reason, actionable=True):
         family = reason.split(" ", 1)[0]
-        return Hit(self.weight if self.mode == "enforce" and actionable else 0.0,
-                   reason, f"rtps:{family}")
+        rule_id = {
+            "rtps_submessage_malformed": "RTPS-02",
+            "rtps_profile_changed": "RTPS-PROFILE-01",
+            "rtps_guid_churn": "RTPS-DISCOVERY-OBS-01",
+        }.get(family, "RTPS-OBS")
+        enabled = self.mode == "enforce" and actionable
+        return Evidence(
+            self.weight if enabled else 0.0, reason, f"rtps:{family}", rule_id,
+            EvidenceClass.CONTEXT_REQUIRED if enabled else EvidenceClass.OBSERVATION_ONLY,
+            IdentificationBasis.PROFILE_BOUND if self.ports else IdentificationBasis.STRUCTURE_VERIFIED,
+            True, enabled, True)
 
     def inspect(self, ctx):
         if self.mode == "off" or (self.ports and ctx.dport not in self.ports):
@@ -586,19 +692,16 @@ class RtpsDetector(Detector):
         flow = ctx.flow or (ctx.proto, ctx.dport)
         if msg.malformed:
             hits.append(self._hit("rtps_submessage_malformed"))
-        old = self._profile.get(flow)
+        old = self._profile.get(flow, None, now)
         profile = (msg.version, msg.vendor)
         if old is not None and old != profile:
             hits.append(self._hit(f"rtps_profile_changed {old!r}->{profile!r}"))
-        self._profile[flow] = profile
-        self._profile.move_to_end(flow)
-        q = self._guids.setdefault(flow, collections.deque())
+        self._profile.put(flow, profile, now)
+        q = self._guids.get(flow, None, now) or collections.deque()
         q.append((now, msg.guid_prefix))
         while q and q[0][0] < now - self.guid_window:
             q.popleft()
+        self._guids.put(flow, q, now)
         if len({guid for _, guid in q}) > self.max_guids:
             hits.append(self._hit(f"rtps_guid_churn unique>{self.max_guids}"))
-        while len(self._profile) > self.max_keys:
-            victim, _ = self._profile.popitem(last=False)
-            self._guids.pop(victim, None)
         return hits

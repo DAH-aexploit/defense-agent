@@ -20,11 +20,13 @@ if str(ROOT) not in sys.path:
 
 import signatures
 from defender import (MSG_HEARTBEAT, MSG_PACKET, MSG_VERDICT, VERDICT_ACCEPT,
-                      VERDICT_DROP, BackgroundAnalyst, UnknownSampler,
+                      VERDICT_DROP, BackgroundAnalyst, ParseStatus, UnknownSampler,
                       VerdictEngine, _validate_llm_result, heartbeat_loop,
                       main_loop)
-from detectors import (CcsdsDetector, Detector, Hit, MavlinkDetector,
+from detectors import (BoundedState, CcsdsDetector, Detector, Evidence,
+                       EvidenceClass, Hit, IdentificationBasis, MavlinkDetector,
                        PacketContext, ParamRangeDetector, RateDetector,
+                       RequestBurstDetector,
                        RtpsDetector, SignatureDetector, crc16_ccitt, normalize,
                        parse_ccsds_packet, parse_mavlink_frames,
                        parse_rtps_message)
@@ -154,10 +156,121 @@ class TestStability(unittest.TestCase):
                          b"\x0a\x00\x00\x01", b"\x0a\x00\x00\x02")  # proto=1(ICMP)
         self.assertEqual(self.e.verdict(ip + b"\x08\x00rest")[0], VERDICT_ACCEPT)
 
-    def test_garbage_bytes_accepted(self):
+    def test_unsupported_version_fuzz_accepted(self):
         import os
         for _ in range(50):
-            self.assertEqual(self.e.verdict(os.urandom(64))[0], VERDICT_ACCEPT)
+            packet = bytearray(os.urandom(64))
+            packet[0] &= 0x0F
+            self.assertEqual(self.e.verdict(bytes(packet))[0], VERDICT_ACCEPT)
+
+
+class TestPacketStructure(unittest.TestCase):
+    """구조 위반과 캡처 불완전의 분리 및 판정 검증"""
+
+    def setUp(self):
+        self.e = VerdictEngine([])
+
+    def test_invalid_ipv4_header_length_is_malformed_and_dropped(self):
+        packet = bytearray(build_packet(8084, b"x"))
+        packet[0] = 0x44
+        verdict, info = self.e.verdict(bytes(packet))
+        self.assertEqual(verdict, VERDICT_DROP)
+        self.assertEqual(info["parse_status"], ParseStatus.MALFORMED.value)
+        self.assertEqual(info["evidence"][0]["rule_id"], "IP4-01")
+
+    def test_capture_shorter_than_ipv4_total_is_incomplete_and_accepted(self):
+        packet = bytearray(build_packet(8084, b"x"))
+        packet[2:4] = (len(packet) + 20).to_bytes(2, "big")
+        verdict, info = self.e.verdict(bytes(packet))
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertEqual(info["parse_status"], ParseStatus.INCOMPLETE.value)
+
+    def test_udp_length_mismatch_is_malformed_and_dropped(self):
+        packet = bytearray(build_udp_packet(8084, b"abc"))
+        packet[24:26] = (7).to_bytes(2, "big")
+        verdict, info = self.e.verdict(bytes(packet))
+        self.assertEqual(verdict, VERDICT_DROP)
+        self.assertEqual(info["evidence"][0]["rule_id"], "L4-UDP-01")
+
+    def test_tcp_null_flags_are_observation_only(self):
+        packet = bytearray(build_packet(8084, b"x"))
+        packet[33] = 0
+        verdict, info = self.e.verdict(bytes(packet))
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        evidence = next(item for item in info["evidence"]
+                        if item["rule_id"] == "L4-TCP-01")
+        self.assertFalse(evidence["drop_eligible"])
+
+
+class TestEvidenceGates(unittest.TestCase):
+    """근거 등급과 프로토콜 식별 조건의 점수 반영 검증"""
+
+    @staticmethod
+    def _packet():
+        return build_udp_packet(5000, b"x")
+
+    def test_observation_only_never_contributes_drop_score(self):
+        class Observe(Detector):
+            def inspect(self, ctx):
+                return [Evidence(9.0, "observation", rule_id="OBS-01",
+                                 evidence_class=EvidenceClass.OBSERVATION_ONLY,
+                                 identification_basis=IdentificationBasis.STRUCTURE_VERIFIED)]
+        verdict, info = VerdictEngine([Observe()]).verdict(self._packet())
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertEqual(info["score"], 0.0)
+
+    def test_unverified_identification_never_contributes_drop_score(self):
+        class Unverified(Detector):
+            def inspect(self, ctx):
+                return [Evidence(9.0, "guess", rule_id="PROTO-01",
+                                 evidence_class=EvidenceClass.ATTACK_PATTERN_CONFIRMED,
+                                 identification_basis=IdentificationBasis.SCHEMA_DEPENDENT,
+                                 identification_verified=False)]
+        verdict, info = VerdictEngine([Unverified()]).verdict(self._packet())
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertFalse(info["evidence"][0]["drop_eligible"])
+
+    def test_context_required_needs_satisfied_prerequisites(self):
+        class MissingContext(Detector):
+            def inspect(self, ctx):
+                return [Evidence(1.0, "missing profile", rule_id="CTX-01",
+                                 prerequisites_satisfied=False)]
+        self.assertEqual(VerdictEngine([MissingContext()]).verdict(self._packet())[0],
+                         VERDICT_ACCEPT)
+
+
+class TestBoundedState(unittest.TestCase):
+    """공통 상태 저장소의 key 상한과 TTL 검증"""
+
+    def test_capacity_uses_lru_eviction(self):
+        state = BoundedState(max_keys=2, ttl=10, now=lambda: 0)
+        state.put("a", 1)
+        state.put("b", 2)
+        state.get("a")
+        state.put("c", 3)
+        self.assertEqual(len(state), 2)
+        self.assertIsNone(state.get("b"))
+        self.assertEqual(state.get("a"), 1)
+
+    def test_ttl_expiration(self):
+        clock = {"t": 0.0}
+        state = BoundedState(max_keys=2, ttl=1, now=lambda: clock["t"])
+        state.put("a", 1)
+        clock["t"] = 1.1
+        self.assertIsNone(state.get("a"))
+
+    def test_access_refreshes_ttl(self):
+        clock = {"t": 0.0}
+        state = BoundedState(max_keys=2, ttl=1, now=lambda: clock["t"])
+        state.put("a", 1)
+        clock["t"] = 0.8
+        self.assertEqual(state.get("a"), 1)
+        clock["t"] = 1.5
+        self.assertEqual(state.get("a"), 1)
+
+
+class TestRuleLoadingAndBudget(unittest.TestCase):
+    """룰 적재 실패 격리와 판정 시간 예산 검증"""
 
     def test_bad_signature_is_skipped_not_fatal(self):
         # 불량 룰(정규식 오류) 혼재 시 engine 기동과 나머지 룰 동작
@@ -211,7 +324,8 @@ class TestDetectorPlugins(unittest.TestCase):
     def test_rate_detector_flags_burst(self):
         # 이상: 포트별 요청 rate 급증(대량 명령 mass-push), now 주입으로 결정성 확보
         clock = {"t": 0.0}
-        det = RateDetector(per_sec=3, window=1.0, weight=1.0, now=lambda: clock["t"])
+        det = RequestBurstDetector(
+            per_sec=3, window=1.0, weight=1.0, now=lambda: clock["t"])
         e = VerdictEngine([det])
         pkt = packet_for(8086, "/cmd")
         verdicts = [e.verdict(pkt)[0] for _ in range(5)]  # 같은 순간 5회 → 임계(3) 초과
@@ -220,10 +334,13 @@ class TestDetectorPlugins(unittest.TestCase):
 
     def test_rate_is_scoped_per_flow_by_default(self):
         clock = {"t": 0.0}
-        det = RateDetector(per_sec=2, now=lambda: clock["t"])
+        det = RequestBurstDetector(per_sec=2, now=lambda: clock["t"])
         e = VerdictEngine([det])
         packets = [build_packet(8086, b"x", sport=41000 + n) for n in range(4)]
         self.assertTrue(all(e.verdict(pkt)[0] == VERDICT_ACCEPT for pkt in packets))
+
+    def test_legacy_rate_detector_alias(self):
+        self.assertIs(RateDetector, RequestBurstDetector)
 
     def test_binary_udp_via_param_detector_no_text_cost(self):
         # 바이너리 UDP도 검사기 순회 대상, 텍스트 룰 없으면 정규화 비용 없이 통과
@@ -280,7 +397,7 @@ class TestMavlinkDetector(unittest.TestCase):
         self.assertEqual(info["score"], 0.0)
 
     def test_enforce_mode_drops_replayed_signed_timestamp(self):
-        e = VerdictEngine([MavlinkDetector(mode="enforce")])
+        e = VerdictEngine([MavlinkDetector(mode="enforce", ports=[14550])])
         first = build_udp_packet(14550, _mav2(seq=1, signed=True, timestamp=1000))
         replayed = build_udp_packet(14550, _mav2(seq=2, signed=True, timestamp=1000))
         self.assertEqual(e.verdict(first)[0], VERDICT_ACCEPT)
@@ -288,8 +405,10 @@ class TestMavlinkDetector(unittest.TestCase):
 
     def test_unsigned_sensitive_only_actionable_when_required(self):
         frame = build_udp_packet(14550, _mav2(msgid=76, signed=False))
-        permissive = VerdictEngine([MavlinkDetector(mode="enforce", require_signed=False)])
-        strict = VerdictEngine([MavlinkDetector(mode="enforce", require_signed=True)])
+        permissive = VerdictEngine([
+            MavlinkDetector(mode="enforce", ports=[14550], require_signed=False)])
+        strict = VerdictEngine([
+            MavlinkDetector(mode="enforce", ports=[14550], require_signed=True)])
         self.assertEqual(permissive.verdict(frame)[0], VERDICT_ACCEPT)
         self.assertEqual(strict.verdict(frame)[0], VERDICT_DROP)
 
@@ -297,6 +416,14 @@ class TestMavlinkDetector(unittest.TestCase):
         e = VerdictEngine([MavlinkDetector(mode="enforce", ports=[14550], require_signed=True)])
         self.assertEqual(e.verdict(build_udp_packet(9999, _mav2(msgid=76)))[0], VERDICT_ACCEPT)
 
+    def test_enforce_without_port_profile_remains_non_blocking(self):
+        e = VerdictEngine([MavlinkDetector(mode="enforce", require_signed=True)])
+        packet = build_udp_packet(14550, _mav2(msgid=76, signed=False))
+        verdict, info = e.verdict(packet)
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        evidence = next(item for item in info["evidence"]
+                        if item["rule_id"] == "MAV-02")
+        self.assertFalse(evidence["identification_verified"])
 
 def _ccsds(seq=1, apid=42, payload=b"abc", fecf=False, corrupt=False):
     first = apid & 0x7FF
@@ -322,12 +449,19 @@ class TestCcsdsDetector(unittest.TestCase):
         self.assertIn("ccsds_fecf_invalid apid=42", info["reasons"])
 
     def test_enforce_detects_sequence_replay(self):
-        e = VerdictEngine([CcsdsDetector(mode="enforce")])
+        e = VerdictEngine([CcsdsDetector(mode="enforce", ports=[10000])])
         pkt = build_udp_packet(10000, _ccsds(seq=9))
         self.assertEqual(e.verdict(pkt)[0], VERDICT_ACCEPT)
         # 첫 이상 관찰과 단기 구간 내 두 번째 동일 이상 확정
         self.assertEqual(e.verdict(pkt)[0], VERDICT_ACCEPT)
         self.assertEqual(e.verdict(pkt)[0], VERDICT_DROP)
+
+    def test_enforce_without_port_profile_remains_observation_only(self):
+        e = VerdictEngine([CcsdsDetector(mode="enforce")])
+        pkt = build_udp_packet(10000, _ccsds(seq=9, fecf=True, corrupt=True))
+        verdict, info = e.verdict(pkt)
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertFalse(info["evidence"][0]["identification_verified"])
 
 
 def _rtps(guid=b"G" * 12, version=(2, 3), vendor=b"\x01\x0f", malformed=False):

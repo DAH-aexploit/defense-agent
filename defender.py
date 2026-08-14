@@ -32,9 +32,12 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
+from enum import StrEnum
 
-from detectors import (CcsdsDetector, MavlinkDetector, PacketContext,
-                       ParamRangeDetector, RateDetector, RtpsDetector,
+from detectors import (CcsdsDetector, Evidence, EvidenceClass, IdentificationBasis,
+                       MavlinkDetector, PacketContext,
+                       ParamRangeDetector, RequestBurstDetector, RtpsDetector,
                        SignatureDetector)
 
 
@@ -114,6 +117,24 @@ VERDICT_BUDGET_MS = float(os.environ.get("DEF_VERDICT_BUDGET_MS", "50"))  # 개�
 STREAM_WINDOW = int(os.environ.get("DEF_STREAM_WINDOW", "32768"))
 STREAM_TTL = float(os.environ.get("DEF_STREAM_TTL", "5.0"))
 _TCP, _UDP = 6, 17  # 방산 프로토콜(MAVLink/CCSDS/DDS)은 대개 UDP → 양쪽 다 파싱
+
+
+class ParseStatus(StrEnum):
+    """네트워크 패킷 파싱 결과 분류"""
+
+    VALID = "valid"
+    MALFORMED = "malformed"
+    INCOMPLETE = "incomplete"
+    UNSUPPORTED = "unsupported"
+
+
+@dataclass
+class ParseResult:
+    """파싱 상태와 검사 컨텍스트 및 구조 검증 근거"""
+
+    status: ParseStatus
+    context: PacketContext | None = None
+    evidence: list[Evidence] = field(default_factory=list)
 
 
 class _BudgetExceeded(Exception):
@@ -197,70 +218,151 @@ class VerdictEngine:
             wl.setdefault(port, []).append(rx)
         return wl
 
-    # -- 파싱: raw IPv4/IPv6 → (proto, dport, payload, metadata) 또는 None ---------
-    # 프로토콜 중립: TCP/UDP 파싱과 애플리케이션 페이로드 노출
-    # 본선 프로토콜 미확정에 따른 특정 애플리케이션(HTTP 등) 종속 배제
-    # 기타 프로토콜은 None → 상위에서 ACCEPT(fail-open)
     @staticmethod
-    def parse_l4(pkt: bytes):
+    def _network_evidence(rule_id: str, reason: str, *, actionable=True,
+                          packet_complete=True) -> Evidence:
+        """네트워크 구조 검증 결과의 표준 Evidence 변환"""
+        return Evidence(
+            1.0 if actionable else 0.0,
+            reason,
+            f"network:{rule_id}",
+            rule_id,
+            EvidenceClass.VIOLATION_CONFIRMED if actionable
+            else EvidenceClass.OBSERVATION_ONLY,
+            IdentificationBasis.STRUCTURE_VERIFIED,
+            True,
+            actionable,
+            packet_complete,
+        )
+
+    @classmethod
+    def parse_packet(cls, pkt: bytes) -> ParseResult:
+        """raw IPv4/IPv6의 구조 검증 및 TCP/UDP 검사 컨텍스트 생성"""
         if not pkt:
-            return None
+            return ParseResult(ParseStatus.INCOMPLETE)
         version = pkt[0] >> 4
+        evidence: list[Evidence] = []
         if version == 4:
             if len(pkt) < 20:
-                return None
+                return ParseResult(ParseStatus.INCOMPLETE)
             ihl = (pkt[0] & 0x0F) * 4
-            if ihl < 20 or len(pkt) < ihl:
-                return None
+            if ihl < 20:
+                evidence.append(cls._network_evidence(
+                    "IP4-01", f"ipv4_header_length_invalid ihl={ihl}"))
+                return ParseResult(ParseStatus.MALFORMED, evidence=evidence)
+            if len(pkt) < ihl:
+                return ParseResult(ParseStatus.INCOMPLETE)
             total = struct.unpack_from(">H", pkt, 2)[0]
-            if total and total < ihl:
-                return None
-            end = min(len(pkt), total or len(pkt))
+            if total < ihl:
+                evidence.append(cls._network_evidence(
+                    "IP4-01", f"ipv4_total_length_invalid total={total} ihl={ihl}"))
+                return ParseResult(ParseStatus.MALFORMED, evidence=evidence)
+            if total > len(pkt):
+                return ParseResult(ParseStatus.INCOMPLETE)
+            end = total
             frag = struct.unpack_from(">H", pkt, 6)[0]
-            if frag & 0x3FFF:  # MF 또는 fragment offset: 불완전 L4는 오탐 방지를 위해 통과
-                return None
+            if frag & 0x8000:
+                evidence.append(cls._network_evidence(
+                    "IP4-02", "ipv4_reserved_flag_set"))
+                return ParseResult(ParseStatus.MALFORMED, evidence=evidence)
+            if frag & 0x3FFF:
+                evidence.append(cls._network_evidence(
+                    "IP4-03", "ipv4_fragment_requires_reassembly",
+                    actionable=False, packet_complete=False))
+                return ParseResult(ParseStatus.INCOMPLETE, evidence=evidence)
             proto, src, dst, off = pkt[9], pkt[12:16], pkt[16:20], ihl
         elif version == 6:
             if len(pkt) < 40:
-                return None
+                return ParseResult(ParseStatus.INCOMPLETE)
             payload_len = struct.unpack_from(">H", pkt, 4)[0]
-            end = min(len(pkt), 40 + payload_len)
+            if payload_len == 0:
+                return ParseResult(ParseStatus.UNSUPPORTED, evidence=[
+                    cls._network_evidence("IP6-04", "ipv6_jumbogram_unsupported",
+                                          actionable=False)])
+            end = 40 + payload_len
+            if end > len(pkt):
+                return ParseResult(ParseStatus.INCOMPLETE)
             proto, src, dst, off = pkt[6], pkt[8:24], pkt[24:40], 40
-            # Hop-by-Hop/Routing/Destination Options/AH, Fragment는 완전 재조립 없이는 통과
+            extension_count = 0
             while proto in (0, 43, 60, 51):
+                extension_count += 1
+                if extension_count > 8:
+                    evidence.append(cls._network_evidence(
+                        "IP6-01", "ipv6_extension_chain_too_deep"))
+                    return ParseResult(ParseStatus.MALFORMED, evidence=evidence)
                 if off + 2 > end:
-                    return None
+                    return ParseResult(ParseStatus.INCOMPLETE)
+                current = proto
                 nxt = pkt[off]
-                ext_len = (pkt[off + 1] + 1) * 8 if proto != 51 else (pkt[off + 1] + 2) * 4
+                ext_len = ((pkt[off + 1] + 2) * 4 if current == 51
+                           else (pkt[off + 1] + 1) * 8)
                 if ext_len < 8 or off + ext_len > end:
-                    return None
+                    evidence.append(cls._network_evidence(
+                        "IP6-01", f"ipv6_extension_length_invalid type={current}"))
+                    return ParseResult(ParseStatus.MALFORMED, evidence=evidence)
+                if current == 43 and ext_len >= 4 and pkt[off + 2] == 0:
+                    evidence.append(cls._network_evidence(
+                        "IP6-02", "ipv6_routing_header_type_zero",
+                        actionable=False))
                 proto, off = nxt, off + ext_len
             if proto == 44:
-                return None
+                evidence.append(cls._network_evidence(
+                    "IP6-03", "ipv6_fragment_requires_reassembly",
+                    actionable=False, packet_complete=False))
+                return ParseResult(ParseStatus.INCOMPLETE, evidence=evidence)
         else:
-            return None
+            return ParseResult(ParseStatus.UNSUPPORTED)
+
         if proto == _TCP:
             if end < off + 20:
-                return None
+                evidence.append(cls._network_evidence(
+                    "L4-TCP-05", "tcp_header_truncated_in_ip_datagram"))
+                return ParseResult(ParseStatus.MALFORMED, evidence=evidence)
             sport, dport, seq = struct.unpack_from(">HHI", pkt, off)
             data_off = (pkt[off + 12] >> 4) * 4
             if data_off < 20 or end < off + data_off:
-                return None
+                evidence.append(cls._network_evidence(
+                    "L4-TCP-05", f"tcp_data_offset_invalid offset={data_off}"))
+                return ParseResult(ParseStatus.MALFORMED, evidence=evidence)
             payload = pkt[off + data_off:end]
             flags = pkt[off + 13]
+            if flags == 0 or flags & 0x07 == 0x07 or flags & 0x03 == 0x03:
+                evidence.append(cls._network_evidence(
+                    "L4-TCP-01", f"tcp_flag_combination_observed flags=0x{flags:02x}",
+                    actionable=False))
         elif proto == _UDP:
             if end < off + 8:
-                return None
+                evidence.append(cls._network_evidence(
+                    "L4-UDP-01", "udp_header_truncated_in_ip_datagram"))
+                return ParseResult(ParseStatus.MALFORMED, evidence=evidence)
             sport, dport = struct.unpack_from(">HH", pkt, off)
             udp_len = struct.unpack_from(">H", pkt, off + 4)[0]
-            if udp_len and (udp_len < 8 or off + udp_len > end):
-                return None
-            payload = pkt[off + 8: off + udp_len] if udp_len else pkt[off + 8:end]
+            if udp_len < 8 or off + udp_len != end:
+                evidence.append(cls._network_evidence(
+                    "L4-UDP-01", f"udp_length_mismatch udp={udp_len} ip={end - off}"))
+                return ParseResult(ParseStatus.MALFORMED, evidence=evidence)
+            payload = pkt[off + 8:end]
             seq, flags = None, 0
         else:
-            return None  # 기타 프로토콜(ICMP 등)은 검사 대상 아님 → 통과
-        meta = (version, proto, src, dst, sport, dport, seq, flags)
-        return proto, dport, payload, meta
+            return ParseResult(ParseStatus.UNSUPPORTED, evidence=evidence)
+
+        flow = (version, proto, src, dst, sport, dport)
+        context = PacketContext(proto, dport, payload, flow=flow, ip_version=version,
+                                segment_payload=payload, transport_seq=seq,
+                                transport_flags=flags)
+        return ParseResult(ParseStatus.VALID, context, evidence)
+
+    @classmethod
+    def parse_l4(cls, pkt: bytes):
+        """기존 tuple 파싱 API 호환 계층"""
+        parsed = cls.parse_packet(pkt)
+        if parsed.status is not ParseStatus.VALID or parsed.context is None:
+            return None
+        ctx = parsed.context
+        version, proto, src, dst, sport, dport = ctx.flow
+        meta = (version, proto, src, dst, sport, dport,
+                ctx.transport_seq, ctx.transport_flags)
+        return proto, dport, ctx.payload, meta
 
     def _whitelisted(self, dport: int, norm: str) -> bool:
         for port in (dport, 0):
@@ -269,11 +371,45 @@ class VerdictEngine:
                     return True
         return False
 
-    # -- 점수 산정: 검사기 순회 → 독립 source별 최고 weight 합산, 절대 raise 안 함 --
-    def score(self, ctx: PacketContext):
+    @staticmethod
+    def _evidence_record(item: Evidence) -> dict:
+        """로그 및 QA용 Evidence 직렬화"""
+        return {
+            "rule_id": item.rule_id,
+            "class": item.evidence_class.value,
+            "identification_basis": item.identification_basis.value,
+            "identification_verified": item.identification_verified,
+            "prerequisites_satisfied": item.prerequisites_satisfied,
+            "packet_complete": item.packet_complete,
+            "drop_eligible": item.drop_eligible,
+            "weight": item.weight,
+            "source": item.source,
+            "reason": item.reason,
+        }
+
+    # -- 점수 산정: 검사기 순회 → 독립 source별 최고 weight 합산, 절대 raise 없음 --
+    def _score(self, ctx: PacketContext | None, initial_evidence=()):
         total = 0.0
         reasons: list[str] = []
         source_scores: dict[str, float] = {}
+        all_evidence: list[Evidence] = []
+
+        def add(items):
+            nonlocal total
+            for item in items:
+                all_evidence.append(item)
+                reasons.append(item.reason)
+                if not item.drop_eligible:
+                    continue
+                source = item.source or item.rule_id or item.reason
+                previous = source_scores.get(source, 0.0)
+                if item.weight > previous:
+                    source_scores[source] = item.weight
+                    total += item.weight - previous
+
+        add(initial_evidence)
+        if ctx is None or total >= self.drop_threshold:
+            return total >= self.drop_threshold, total, reasons, all_evidence
         start = time.monotonic()
         for det in self.detectors:
             # 검사기 단위 타임박스: 예산 초과 시 남은 검사기 스킵(안전측 판정)
@@ -300,47 +436,58 @@ class VerdictEngine:
                     raise _BudgetExceeded()
             except _BudgetExceeded:
                 logging.warning("detector budget exceeded; ACCEPT (fail-open)")
-                return False, 0.0, ["budget_exceeded"]
+                return False, 0.0, ["budget_exceeded"], []
             except Exception:              # noqa: BLE001 - 검사기 오류는 무시(fail-open)
                 logging.exception("detector %s error (ignored)", getattr(det, "name", "?"))
                 continue
-            for h in hits:
-                reasons.append(h.reason)
-                # quorum 기준은 관측 횟수가 아닌 독립 근거의 합
-                # 동일 패킷 내 같은 룰·상태 이상 반복 시 source별 최고 weight만 반영
-                source = h.source or f"{getattr(det, 'name', '?')}:{h.reason}"
-                previous = source_scores.get(source, 0.0)
-                if h.weight > previous:
-                    source_scores[source] = h.weight
-                    total += h.weight - previous
+            for hit in hits:
+                if not hit.source:
+                    hit.source = f"{getattr(det, 'name', '?')}:{hit.reason}"
+            add(hits)
             if total >= self.drop_threshold:
                 break  # 임계 도달 — 조기 종료
-        return (total >= self.drop_threshold), total, reasons
+        return total >= self.drop_threshold, total, reasons, all_evidence
+
+    def score(self, ctx: PacketContext):
+        """기존 3-tuple 점수 API 호환 계층"""
+        drop, total, reasons, _evidence = self._score(ctx)
+        return drop, total, reasons
 
     # -- 최종 판정: verdict byte + 관찰 info, fail-open 보장 ---------------------
     def verdict(self, pkt: bytes):
-        info = {"drop": False, "reasons": [], "dport": None, "proto": None, "snippet": ""}
+        info = {"drop": False, "reasons": [], "dport": None, "proto": None,
+                "snippet": "", "score": 0.0, "parse_status": ParseStatus.UNSUPPORTED.value,
+                "evidence": []}
         try:
-            parsed = self.parse_l4(pkt)
-            if parsed is None:
-                return VERDICT_ACCEPT, info      # 비TCP/UDP·파싱불가 → 통과
-            proto, dport, payload, meta = parsed
-            info["dport"] = dport
-            info["proto"] = proto
-            if not payload:
+            parsed = self.parse_packet(pkt)
+            info["parse_status"] = parsed.status.value
+            if parsed.status is ParseStatus.MALFORMED:
+                drop, sc, reasons, evidence = self._score(None, parsed.evidence)
+                info.update(drop=drop, score=sc, reasons=reasons,
+                            evidence=[self._evidence_record(item) for item in evidence])
+                return (VERDICT_DROP if drop else VERDICT_ACCEPT), info
+            if parsed.status is not ParseStatus.VALID or parsed.context is None:
+                info["reasons"] = [item.reason for item in parsed.evidence]
+                info["evidence"] = [self._evidence_record(item) for item in parsed.evidence]
                 return VERDICT_ACCEPT, info
-            version, _proto, src, dst, sport, _dport, seq, _flags = meta
-            flow = (version, proto, src, dst, sport, dport)
-            inspect_payload = self.streams.add(flow, seq, payload) if proto == _TCP else payload
+            base_ctx = parsed.context
+            proto, dport, payload = base_ctx.proto, base_ctx.dport, base_ctx.payload
+            info["dport"], info["proto"] = dport, proto
+            inspect_payload = (self.streams.add(base_ctx.flow, base_ctx.transport_seq, payload)
+                               if proto == _TCP else payload)
             ctx = PacketContext(proto, dport, inspect_payload, self.payload_cap,
-                                flow=flow, ip_version=version, segment_payload=payload)
+                                flow=base_ctx.flow, ip_version=base_ctx.ip_version,
+                                segment_payload=payload,
+                                transport_seq=base_ctx.transport_seq,
+                                transport_flags=base_ctx.transport_flags)
             # 화이트리스트(텍스트 서비스용)가 있을 때만 norm을 계산해 즉시 ACCEPT 판단
             # 화이트리스트 부재 시 norm 계산 생략, 바이너리 검사기 비용 0
             if self._wl_count and self._whitelisted(dport, ctx.norm):
                 return VERDICT_ACCEPT, info
-            drop, sc, reasons = self.score(ctx)
+            drop, sc, reasons, evidence = self._score(ctx, parsed.evidence)
             info["reasons"] = reasons
             info["score"] = sc
+            info["evidence"] = [self._evidence_record(item) for item in evidence]
             if drop:
                 info["drop"] = True
                 info["snippet"] = inspect_payload[:120].decode("latin-1", "ignore")
@@ -375,7 +522,7 @@ def load_engine() -> VerdictEngine:
             extra.append(ParamRangeDetector(param_rules))
         rate_cfg = getattr(signatures, "RATE_LIMIT", None)
         if rate_cfg:
-            extra.append(RateDetector(**rate_cfg))
+            extra.append(RequestBurstDetector(**rate_cfg))
     except Exception as e:                       # noqa: BLE001 - 룰 없으면 ACCEPT-all로 안전 기동
         logging.warning("signatures import failed (%s) — ACCEPT-all", e)
     # 프로토콜 미확정 단계의 내장 상태형 관찰기, 기본 observe(weight=0)로 DROP 제외
