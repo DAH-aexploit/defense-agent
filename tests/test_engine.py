@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 import socket
 import struct
 import hmac
@@ -19,24 +20,29 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import signatures
 from defender import (MSG_HEARTBEAT, MSG_PACKET, MSG_VERDICT, VERDICT_ACCEPT,
-                      VERDICT_DROP, BackgroundAnalyst, ParseStatus, UnknownSampler,
-                      VerdictEngine, _validate_llm_result, heartbeat_loop,
+                      VERDICT_DROP, BackgroundAnalyst, ParseStatus, TcpStreamWindow,
+                      UnknownSampler,
+                      VerdictEngine, _validate_llm_result, classify_rule_coverage, heartbeat_loop,
                       main_loop)
 from detectors import (BoundedState, CcsdsDetector, Detector, Evidence,
                        EvidenceClass, Hit, IdentificationBasis, MavlinkDetector,
                        PacketContext, ParamRangeDetector, RateDetector,
                        RequestBurstDetector,
-                       RtpsDetector, SignatureDetector, crc16_ccitt, mavlink_frame_crc, normalize,
+                       RtpsDetector, SignatureDetector,
+                       crc16_ccitt, mavlink_frame_crc, normalize,
                        parse_ccsds_packet, parse_mavlink_frames,
                        parse_rtps_message)
+# 리허설 스켈레톤 전용 검사기 — 본선 무관, rehearsal_web_detectors.py 참조
+from rehearsal_web_detectors import (AuthSessionDetector, L3ProductIdDetector,
+                                     McsScriptTraversalDetector, UrlSsrGuardDetector)
 from tests.packet_util import (build_ipv6_packet, build_packet, build_udp_packet,
                                http_get, packet_for)
+from tests.rule_fixtures import TEST_SIGNATURES, TEST_WHITELIST
 
 
 def engine() -> VerdictEngine:
-    return VerdictEngine.from_config(signatures.SIGNATURES, signatures.WHITELIST)
+    return VerdictEngine.from_config(TEST_SIGNATURES, TEST_WHITELIST)
 
 
 class TestAttackDetection(unittest.TestCase):
@@ -107,6 +113,289 @@ class TestFalsePositiveGuard(unittest.TestCase):
         v, info = self.e.verdict(packet_for(8082, "/static/../css/app.css"))
         self.assertEqual(v, VERDICT_ACCEPT)
         self.assertGreater(info.get("score", 0), 0)  # 관찰 대상으로 점수는 잡힘
+
+
+class TestUrlSsrfGuard(unittest.TestCase):
+    def setUp(self):
+        self.e = VerdictEngine([UrlSsrGuardDetector()])
+
+    def _verdict(self, path, **kwargs):
+        return self.e.verdict(packet_for(8082, path, **kwargs))[0]
+
+    def test_internal_hostname_encoded_dropped(self):
+        path = "/fetch?url=http%3A%2F%2Fhelper-box%3A8080%2Fsecret"
+        self.assertEqual(self._verdict(path), VERDICT_DROP)
+
+    def test_file_scheme_dropped(self):
+        self.assertEqual(self._verdict("/fetch?url=file:///flag"), VERDICT_DROP)
+
+    def test_other_dangerous_schemes_dropped(self):
+        for scheme in ("gopher", "ftp", "dict", "data"):
+            with self.subTest(scheme=scheme):
+                self.assertEqual(self._verdict(f"/fetch?url={scheme}://example.test/x"),
+                                 VERDICT_DROP)
+
+    def test_non_global_ip_variants_dropped(self):
+        targets = ("127.0.0.1", "127.1", "0177.0.0.1", "[::1]", "0x7f000001",
+                   "10.0.0.1", "169.254.169.254")
+        for target in targets:
+            with self.subTest(target=target):
+                self.assertEqual(self._verdict(f"/fetch?url=http://{target}/registry"),
+                                 VERDICT_DROP)
+
+    def test_normal_external_urls_accepted(self):
+        self.assertEqual(self._verdict("/fetch?url=https://example.com/data"), VERDICT_ACCEPT)
+        self.assertEqual(self._verdict("/fetch?url=http://example.com/data"), VERDICT_ACCEPT)
+
+    def test_health_and_root_accepted(self):
+        self.assertEqual(self._verdict("/health"), VERDICT_ACCEPT)
+        self.assertEqual(self._verdict("/"), VERDICT_ACCEPT)
+
+    def test_user_agent_does_not_bypass_guard(self):
+        path = "/fetch?url=http%3A%2F%2Fhelper-box%3A8080%2Fsecret"
+        self.assertEqual(self._verdict(path, extra={"User-Agent": "lig-sla/1.0"}),
+                         VERDICT_DROP)
+
+    def test_attack_text_outside_url_parameter_accepted(self):
+        self.assertEqual(self._verdict("/fetch?note=file:///flag"), VERDICT_ACCEPT)
+
+    def test_percent_encoded_request_path_dropped(self):
+        # 리허설 Round 14 관측 우회, `/%66%65%74%63%68` = `/fetch`
+        path = "/%66%65%74%63%68?url=http%3A%2F%2Fhelper-box%3A8080%2Fsecret"
+        self.assertEqual(self._verdict(path), VERDICT_DROP)
+
+    def test_fully_encoded_path_and_parameter_dropped(self):
+        path = ("/%66%65%74%63%68?%75%72%6C=%68%74%74%70%3A%2F%2F"
+                "%68%65%6C%70%65%72%2D%62%6F%78%3A%38%30%38%30%2F%73%65%63%72%65%74")
+        self.assertEqual(self._verdict(path), VERDICT_DROP)
+
+    def test_double_encoded_parameter_name_dropped(self):
+        path = "/fetch?%2575%2572%256C=http%3A%2F%2Fhelper-box%3A8080%2Fsecret"
+        self.assertEqual(self._verdict(path), VERDICT_DROP)
+
+    def test_unrelated_encoded_path_still_accepted(self):
+        # `/fetch` 계열이 아닌 경로는 디코딩 후에도 검사 대상이 아니다
+        self.assertEqual(self._verdict("/%68%65%61%6C%74%68"), VERDICT_ACCEPT)
+
+
+def _split(payload: bytes, size: int, base_seq: int = 1) -> list[tuple[int, bytes]]:
+    """payload를 size 단위 TCP 세그먼트 (seq, bytes) 목록으로 분할"""
+    return [(base_seq + i, payload[i:i + size])
+            for i in range(0, len(payload), size)]
+
+
+class TestSegmentReassembly(unittest.TestCase):
+    """TCP 분할·순서 뒤섞기 회피 대응
+
+    리허설 Round 13·14에서 공격자가 요청 하나를 7~29개 세그먼트로 쪼개고 순서를
+    뒤섞어 전송해 모든 룰을 회피한 사례에 대한 회귀 검증이다.
+    """
+
+    SSRF = http_get("/fetch?url=http%3A%2F%2Fhelper-box%3A8080%2Fsecret",
+                    host="team9.lig.internal:8082")
+    BENIGN = http_get("/fetch?url=https%3A%2F%2Fexample.com%2Fdata",
+                      host="team9.lig.internal:8082")
+
+    def _feed(self, segments, dport=8082, sport=40001, engine=None):
+        """세그먼트를 주어진 순서로 판정하고 verdict 목록 반환"""
+        e = engine or VerdictEngine([UrlSsrGuardDetector()])
+        return [e.verdict(build_packet(dport, payload, sport=sport, seq=seq))[0]
+                for seq, payload in segments]
+
+    def test_reordered_segments_are_reassembled_and_dropped(self):
+        segments = _split(self.SSRF, 8)
+        shuffled = segments[3:] + segments[:3]       # 앞부분을 뒤로 미룬 순서 뒤섞기
+        verdicts = self._feed(shuffled)
+        self.assertIn(VERDICT_DROP, verdicts)
+
+    def test_completing_segment_is_the_one_dropped(self):
+        """빈 구간을 메우는 마지막 세그먼트에서 요청 전체가 드러나 DROP된다"""
+        segments = _split(self.SSRF, 8)
+        head, rest = segments[0], segments[1:]
+        verdicts = self._feed(rest + [head])
+        self.assertEqual(verdicts[-1], VERDICT_DROP)
+        self.assertNotIn(VERDICT_DROP, verdicts[:-1])
+
+    def test_in_order_segments_dropped(self):
+        self.assertIn(VERDICT_DROP, self._feed(_split(self.SSRF, 8)))
+
+    def test_many_small_segments_dropped(self):
+        # 실제 관측된 13~29 세그먼트 규모
+        self.assertIn(VERDICT_DROP, self._feed(_split(self.SSRF, 4)))
+
+    def test_retransmitted_segment_keeps_same_verdict(self):
+        """DROP된 세그먼트가 재전송돼도 동일하게 DROP된다"""
+        segments = _split(self.SSRF, 8)
+        e = VerdictEngine([UrlSsrGuardDetector()])
+        first = self._feed(segments[1:] + [segments[0]], engine=e)
+        self.assertEqual(first[-1], VERDICT_DROP)
+        replay = self._feed([segments[0]], engine=e)
+        self.assertEqual(replay[0], VERDICT_DROP)
+
+    def test_split_benign_request_accepted(self):
+        """정상 요청은 분할·순서 뒤섞임과 무관하게 통과한다 (SLA 오탐 방지)"""
+        segments = _split(self.BENIGN, 8)
+        verdicts = self._feed(segments[4:] + segments[:4])
+        self.assertNotIn(VERDICT_DROP, verdicts)
+
+    def test_split_admin_session_reassembled_and_dropped(self):
+        token = base64.b64encode(b'{"user":"guest","role":"admin"}').decode()
+        request = http_get("/admin", host="team9.lig.internal:8083",
+                           cookie=f"session={token}")
+        segments = _split(request, 6)
+        e = VerdictEngine([AuthSessionDetector(mode="enforce")])
+        verdicts = self._feed(segments[2:] + segments[:2], dport=8083, engine=e)
+        self.assertIn(VERDICT_DROP, verdicts)
+
+    def test_separate_flows_do_not_merge(self):
+        """서로 다른 flow의 조각이 합쳐져 오탐을 만들지 않는다"""
+        segments = _split(self.SSRF, 8)
+        e = VerdictEngine([UrlSsrGuardDetector()])
+        verdicts = [
+            e.verdict(build_packet(8082, payload, sport=40001 + index, seq=seq))[0]
+            for index, (seq, payload) in enumerate(segments)
+        ]
+        self.assertNotIn(VERDICT_DROP, verdicts)
+
+
+class TestTcpStreamWindow(unittest.TestCase):
+    FLOW = (4, 6, b"\x0a\x00\x00\x01", b"\x0a\x00\x00\x02", 40001, 8082)
+
+    def _window(self, clock=None, **kwargs):
+        return TcpStreamWindow(now=clock or (lambda: 0.0), **kwargs)
+
+    def test_out_of_order_segments_assemble_in_seq_order(self):
+        w = self._window()
+        self.assertEqual(w.add(self.FLOW, 100, b"AAA"), b"AAA")
+        self.assertEqual(w.add(self.FLOW, 106, b"CCC"), b"CCC")   # 빈 구간 존재
+        self.assertEqual(w.add(self.FLOW, 103, b"BBB"), b"AAABBBCCC")
+
+    def test_pending_segment_returns_itself_only(self):
+        """빈 구간이 남은 조각은 없는 인접성을 만들지 않는다"""
+        w = self._window()
+        w.add(self.FLOW, 100, b"AAA")
+        self.assertEqual(w.add(self.FLOW, 200, b"ZZZ"), b"ZZZ")
+
+    def test_overlapping_segment_keeps_first_content(self):
+        w = self._window()
+        w.add(self.FLOW, 100, b"AAAA")
+        self.assertEqual(w.add(self.FLOW, 102, b"XXXX"), b"AAAAXX")
+
+    def test_duplicate_segment_is_idempotent(self):
+        w = self._window()
+        w.add(self.FLOW, 100, b"AAA")
+        w.add(self.FLOW, 103, b"BBB")
+        self.assertEqual(w.add(self.FLOW, 100, b"AAA"), b"AAABBB")
+
+    def test_ttl_expiry_restarts_window(self):
+        clock = [0.0]
+        w = self._window(clock=lambda: clock[0], ttl=5.0)
+        w.add(self.FLOW, 100, b"AAA")
+        clock[0] = 99.0
+        self.assertEqual(w.add(self.FLOW, 103, b"BBB"), b"BBB")
+
+    def test_cap_bounds_assembled_length(self):
+        w = self._window(cap=16)
+        w.add(self.FLOW, 100, b"A" * 12)
+        self.assertEqual(w.add(self.FLOW, 112, b"B" * 12), b"B" * 12)
+
+    def test_flow_table_respects_max_flows(self):
+        w = self._window(max_flows=4)
+        for index in range(40):
+            flow = (4, 6, b"\x0a\x00\x00\x01", b"\x0a\x00\x00\x02", index, 8082)
+            w.add(flow, 1, b"payload")
+        self.assertLessEqual(len(w._flows), 4)
+
+    def test_pending_segment_count_is_bounded(self):
+        w = self._window(max_segments=8)
+        for index in range(60):
+            w.add(self.FLOW, 1000 + index * 10, b"XX")   # 계속 빈 구간을 남기는 조각
+        self.assertLessEqual(len(w._flows[self.FLOW].pending), 8)
+
+
+class TestPhase2Guards(unittest.TestCase):
+    @staticmethod
+    def _admin_packet(path="/admin"):
+        token = base64.b64encode(
+            b'{"user":"checker","role":"admin","is_admin":true}').decode()
+        return packet_for(8083, path, cookie=f"session={token}")
+
+    def test_admin_session_observed_without_drop(self):
+        verdict, info = VerdictEngine([AuthSessionDetector(mode="observe")]).verdict(
+            self._admin_packet())
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        evidence = next(item for item in info["evidence"]
+                        if item["rule_id"] == "MCS-AUTH-SESSION-STRUCTURED")
+        self.assertFalse(evidence["drop_eligible"])
+
+    def test_admin_session_enforce_mode_drops(self):
+        verdict, _ = VerdictEngine([AuthSessionDetector(mode="enforce")]).verdict(
+            self._admin_packet())
+        self.assertEqual(verdict, VERDICT_DROP)
+
+    def test_spoofed_sla_user_agent_does_not_bypass_admin_guard(self):
+        token = base64.b64encode(
+            b'{"user":"checker","role":"admin","admin":true,"is_admin":true}').decode()
+        packet = packet_for(
+            8083, "/admin", cookie=f"session={token}",
+            extra={"User-Agent": "lig-sla/1.0"})
+        verdict, _ = VerdictEngine([AuthSessionDetector(mode="enforce")]).verdict(packet)
+        self.assertEqual(verdict, VERDICT_DROP)
+
+    def test_sla_user_agent_does_not_bypass_other_paths(self):
+        token = base64.b64encode(b'{"role":"admin"}').decode()
+        packet = packet_for(
+            8083, "/openc3-api/admin/keyring", cookie=f"session={token}",
+            extra={"User-Agent": "lig-sla/1.0"})
+        verdict, _ = VerdictEngine([AuthSessionDetector(mode="enforce")]).verdict(packet)
+        self.assertEqual(verdict, VERDICT_DROP)
+
+    def test_octal_escaped_cookie_value_dropped(self):
+        # 리허설 Round 17·18에서 관측된 형태: session="\145yJ..." (옥탈 이스케이프)
+        packet = packet_for(
+            8083, "/admin",
+            cookie='session="\\145yJ1c2V\\171IjogImd1ZXN\\060IiwgInJvbGUiOiAiYWRtaW4ifQ=="')
+        verdict, _ = VerdictEngine([AuthSessionDetector(mode="enforce")]).verdict(packet)
+        self.assertEqual(verdict, VERDICT_DROP)
+
+    def test_hex_escaped_cookie_value_dropped(self):
+        token = base64.b64encode(b'{"user":"guest","role":"admin"}').decode()
+        escaped = "".join(f"\\x{ord(c):02x}" if i % 3 == 0 else c
+                          for i, c in enumerate(token))
+        packet = packet_for(8083, "/admin", cookie=f'session="{escaped}"')
+        verdict, _ = VerdictEngine([AuthSessionDetector(mode="enforce")]).verdict(packet)
+        self.assertEqual(verdict, VERDICT_DROP)
+
+    def test_unicode_escaped_cookie_value_dropped(self):
+        token = base64.b64encode(b'{"user":"guest","role":"admin"}').decode()
+        escaped = "".join(f"\\u{ord(c):04x}" if i % 3 == 0 else c
+                          for i, c in enumerate(token))
+        packet = packet_for(8083, "/admin", cookie=f'session="{escaped}"')
+        verdict, _ = VerdictEngine([AuthSessionDetector(mode="enforce")]).verdict(packet)
+        self.assertEqual(verdict, VERDICT_DROP)
+
+    def test_normal_cookie_without_escapes_still_accepted(self):
+        token = base64.b64encode(b'{"user":"guest","role":"user"}').decode()
+        packet = packet_for(8083, "/admin", cookie=f"session={token}")
+        verdict, _ = VerdictEngine([AuthSessionDetector(mode="enforce")]).verdict(packet)
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+
+    def test_garbage_after_deescape_fails_open_to_accept(self):
+        packet = packet_for(8083, "/admin", cookie='session="\\777not-base64\\xzz"')
+        verdict, _ = VerdictEngine([AuthSessionDetector(mode="enforce")]).verdict(packet)
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+
+    def test_script_flags_traversal_dropped(self):
+        detector = McsScriptTraversalDetector()
+        packet = packet_for(8083, "/script-api/scripts/mcs_ops/../../../../flags/l2")
+        verdict, info = VerdictEngine([detector]).verdict(packet)
+        self.assertEqual(verdict, VERDICT_DROP)
+        self.assertEqual(info["evidence"][0]["rule_id"], "MCS-SCRIPT-TRAVERSAL")
+
+    def test_normal_script_path_accepted(self):
+        detector = McsScriptTraversalDetector()
+        packet = packet_for(8083, "/script-api/scripts/mcs_ops/status")
+        self.assertEqual(VerdictEngine([detector]).verdict(packet)[0], VERDICT_ACCEPT)
 
 
 class TestStability(unittest.TestCase):
@@ -317,10 +606,14 @@ class TestDetectorPlugins(unittest.TestCase):
 
     def test_param_range_detector_flags_out_of_range(self):
         # 방산: 제어 파라미터가 안전범위 밖(dahAgent PARAM_SET 안전범위의 HTTP판)
+        # 서로 다른 두 요청이므로 각각 별도 flow로 보낸다. 같은 flow에 동일 seq로
+        # 보내면 TCP 재조립이 재전송으로 간주해 먼저 도착한 내용을 유지한다.
         det = ParamRangeDetector({8085: {"gain": (0.0, 0.5, 1.0)}})
         e = VerdictEngine([det])
-        self.assertEqual(e.verdict(packet_for(8085, "/ctrl?gain=9.99"))[0], VERDICT_DROP)
-        self.assertEqual(e.verdict(packet_for(8085, "/ctrl?gain=0.3"))[0], VERDICT_ACCEPT)
+        attack = build_packet(8085, http_get("/ctrl?gain=9.99"), sport=40001)
+        normal = build_packet(8085, http_get("/ctrl?gain=0.3"), sport=40002)
+        self.assertEqual(e.verdict(attack)[0], VERDICT_DROP)
+        self.assertEqual(e.verdict(normal)[0], VERDICT_ACCEPT)
 
     def test_rate_detector_flags_burst(self):
         # 이상: 포트별 요청 rate 급증(대량 명령 mass-push), now 주입으로 결정성 확보
@@ -624,7 +917,7 @@ class TestQAGates(unittest.TestCase):
     def _scenario():
         detectors = [MavlinkDetector(mode="observe"), CcsdsDetector(mode="observe"),
                      RtpsDetector(mode="observe")]
-        e = VerdictEngine.from_config(signatures.SIGNATURES, signatures.WHITELIST,
+        e = VerdictEngine.from_config(TEST_SIGNATURES, TEST_WHITELIST,
                                       extra_detectors=detectors)
         packets = [
             packet_for(8082, "/health"),
@@ -643,6 +936,66 @@ class TestQAGates(unittest.TestCase):
         baseline = self._scenario()
         self.assertEqual(self._scenario(), baseline)
         self.assertEqual(self._scenario(), baseline)
+
+    def test_team_rule_catalog_has_complete_coverage_status(self):
+        import signatures
+        active = [str(rule.get("id") or rule.get("rule_id") or "SIG-TEXT")
+                  for rule in signatures.SIGNATURES]
+        coverage = classify_rule_coverage(signatures, active)
+        statuses = ("ENFORCED", "OBSERVED", "IMPLEMENTED_DISABLED",
+                    "PREREQUISITE_MISSING", "PARSER_REQUIRED")
+        self.assertEqual(coverage["TOTAL"], len(signatures.DETECTOR_RULES))
+        self.assertEqual(sum(len(coverage[key]) for key in statuses), coverage["TOTAL"])
+        assigned = [rule_id for key in statuses for rule_id in coverage[key]]
+        self.assertEqual(len(assigned), len(set(assigned)))
+
+    def test_phase3_operational_rules_block_product_union_sqli(self):
+        import signatures
+        e = VerdictEngine.from_config(signatures.SIGNATURES, signatures.WHITELIST)
+        packet = packet_for(
+            8084,
+            "/product?id=-1%20UNION%20SELECT%201,(SELECT%20v%20FROM%20app_meta%20WHERE%20k='deploy_token'),3--",
+        )
+        verdict, info = e.verdict(packet)
+        self.assertEqual(verdict, VERDICT_DROP)
+        self.assertIn("L3-SQL-001", [item["rule_id"] for item in info["evidence"]])
+
+    def test_phase3_operational_rules_accept_numeric_product_id(self):
+        import signatures
+        e = VerdictEngine.from_config(signatures.SIGNATURES, signatures.WHITELIST)
+        verdict, _ = e.verdict(packet_for(8084, "/product?id=5"))
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+
+    def test_phase3_operational_rules_block_encoded_comment_evasion(self):
+        import signatures
+        e = VerdictEngine.from_config(signatures.SIGNATURES, signatures.WHITELIST)
+        verdict, info = e.verdict(packet_for(
+            8084, "/product?id=-1%20UnIoN/**/SeLeCt%201,2,3--"))
+        self.assertEqual(verdict, VERDICT_DROP)
+        self.assertIn("L3-SQL-001", [item["rule_id"] for item in info["evidence"]])
+
+    def test_phase3_structural_guard_decodes_plus_as_space(self):
+        e = VerdictEngine([L3ProductIdDetector(mode="enforce")])
+        verdict, info = e.verdict(packet_for(
+            8084,
+            "/product?id=-1+UNION+ALL+SELECT+1%2Cv%2C3+FROM+app_meta",
+        ))
+        self.assertEqual(verdict, VERDICT_DROP)
+        self.assertIn(
+            "L3-PRODUCT-ID-STRUCTURE",
+            [item["rule_id"] for item in info["evidence"]],
+        )
+
+    def test_phase3_structural_guard_accepts_decimal_id(self):
+        e = VerdictEngine([L3ProductIdDetector(mode="enforce")])
+        self.assertEqual(e.verdict(packet_for(8084, "/product?id=2"))[0], VERDICT_ACCEPT)
+
+    def test_phase3_structural_guard_ignores_irrelevant_parameter(self):
+        e = VerdictEngine([L3ProductIdDetector(mode="enforce")])
+        self.assertEqual(
+            e.verdict(packet_for(8084, "/product?search=union+select"))[0],
+            VERDICT_ACCEPT,
+        )
 
     def test_defender_model_allowlist_excludes_deprecated_model(self):
         import defender
@@ -757,6 +1110,24 @@ class TestPcap(unittest.TestCase):
             self.assertAlmostEqual(out[1][0], 1000.2, places=4)      # 타임스탬프 보존
         finally:
             os.remove(path)
+
+    def test_gzip_pcap_read(self):
+        import gzip
+        import os
+        import tempfile
+
+        from tests.packet_util import write_pcap
+        from tools.pcap_analyze import read_pcap
+
+        with tempfile.TemporaryDirectory() as directory:
+            plain = os.path.join(directory, "sample.pcap")
+            compressed = plain + ".gz"
+            write_pcap(plain, [(1000.0, packet_for(8082, "/health"))])
+            with open(plain, "rb") as src, gzip.open(compressed, "wb") as dst:
+                dst.write(src.read())
+            out = list(read_pcap(compressed))
+            self.assertEqual(len(out), 1)
+            self.assertAlmostEqual(out[0][0], 1000.0, places=4)
 
 
 class TestBrokerContract(unittest.TestCase):

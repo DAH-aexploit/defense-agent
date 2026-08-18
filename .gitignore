@@ -22,3 +22,4 @@ qa-results/
 # 로컬 편집기·AI 확장 지침
 .github/instructions/
 .github/copilot-instructions.md
+CLAUDE.md

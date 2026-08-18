@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import collections
+import argparse
+import gzip
 import re
 import struct
 import sys
@@ -31,8 +33,9 @@ _PROTO_NAME = {6: "TCP", 17: "UDP"}
 
 
 def read_pcap(path: str):
-    """(ts_float, raw_ip_bytes) generator, 손상 record 제외"""
-    with open(path, "rb") as f:
+    """classic PCAP과 PCAP.GZ의 (ts_float, raw_ip_bytes) generator"""
+    opener = gzip.open if str(path).lower().endswith(".gz") else open
+    with opener(path, "rb") as f:
         data = f.read()
     if len(data) < 24:
         return
@@ -66,12 +69,14 @@ def _payload_kind(sample: bytes) -> str:
     return "텍스트" if printable / len(sample) > 0.85 else "바이너리"
 
 
-def analyze(paths: list[str], engine: VerdictEngine | None = None) -> None:
+def analyze(paths: list[str], engine: VerdictEngine | None = None,
+            service_ports: set[int] | None = None) -> None:
     engine = engine or load_engine()
     ports: dict = collections.defaultdict(lambda: {
         "count": 0, "bytes": 0, "protos": set(), "times": [],
         "sample": b"", "repeat": collections.Counter(), "tokens": collections.Counter()})
-    ip_total = drop_total = 0
+    ip_total = drop_total = skipped_direction = 0
+    rule_hits = collections.Counter()
 
     for path in paths:
         try:
@@ -84,6 +89,9 @@ def analyze(paths: list[str], engine: VerdictEngine | None = None) -> None:
             if not parsed:
                 continue
             proto, dport, payload, _ = parsed
+            if service_ports and dport not in service_ports:
+                skipped_direction += 1
+                continue
             ip_total += 1
             p = ports[dport]
             p["count"] += 1
@@ -96,8 +104,12 @@ def analyze(paths: list[str], engine: VerdictEngine | None = None) -> None:
                 p["repeat"][payload[:64]] += 1
                 for tok in _TOKEN_RE.findall(payload[:512].lower()):
                     p["tokens"][tok.decode("latin-1")] += 1
-            if engine.verdict(ip)[0] == VERDICT_DROP:
+            verdict, info = engine.verdict(ip)
+            if verdict == VERDICT_DROP:
                 drop_total += 1
+                for item in info.get("evidence", []):
+                    if item.get("drop_eligible") and item.get("rule_id"):
+                        rule_hits[item["rule_id"]] += 1
 
     if not ip_total:
         print("IPv4/IPv6 패킷을 찾지 못함 (linktype/포맷 확인 — pcapng이면 classic으로 재캡처).")
@@ -105,6 +117,8 @@ def analyze(paths: list[str], engine: VerdictEngine | None = None) -> None:
 
     print(f"\n=== pcap 분석: {', '.join(paths)} ===")
     print(f"IP {ip_total} 패킷 · 포트 {len(ports)}개 · 현재 룰 DROP {drop_total}\n")
+    if service_ports:
+        print(f"인바운드 목적지 포트 {sorted(service_ports)} 기준 · 반대 방향/기타 {skipped_direction}개 제외\n")
     hdr = f"{'포트':>6} {'proto':<7} {'패킷':>6} {'바이트':>8} {'유형':<8} {'peak/s':>6}  샘플"
     print(hdr)
     print("-" * len(hdr))
@@ -137,6 +151,10 @@ def analyze(paths: list[str], engine: VerdictEngine | None = None) -> None:
         print("\n[룰 힌트] (텍스트 포트 — 자주 나오는 토큰에서 시그니처 후보를 고른다)")
         for h in hints:
             print(f" - {h}")
+    if rule_hits:
+        print("\n[DROP 룰 적중]")
+        for rule_id, count in rule_hits.most_common():
+            print(f" - {rule_id}: {count}")
     print("\n→ 판단 후 detectors.py에 Detector를 추가하고 replay/테스트로 오탐 확인 후 배포.")
 
 
@@ -154,10 +172,12 @@ def _peak_rate(times: list[float]) -> int:
 
 
 def main(argv: list[str]) -> int:
-    if not argv:
-        print(__doc__)
-        return 2
-    analyze(argv)
+    parser = argparse.ArgumentParser(description="classic PCAP/PCAP.GZ 방어 룰 재생 분석")
+    parser.add_argument("paths", nargs="+", help="분석할 .pcap 또는 .pcap.gz")
+    parser.add_argument("--service-port", action="append", type=int, default=[],
+                        help="인바운드 목적지 포트 필터, 여러 번 지정 가능")
+    args = parser.parse_args(argv)
+    analyze(args.paths, service_ports=set(args.service_port) or None)
     return 0
 
 

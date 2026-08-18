@@ -35,10 +35,13 @@ import urllib.request
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from detectors import (CcsdsDetector, Evidence, EvidenceClass, IdentificationBasis,
-                       MavlinkDetector, PacketContext,
+from detectors import (CcsdsDetector, Evidence, EvidenceClass,
+                       IdentificationBasis, MavlinkDetector, PacketContext,
                        ParamRangeDetector, RequestBurstDetector, RtpsDetector,
                        SignatureDetector)
+# 리허설 스켈레톤 전용 검사기 — 본선 무관, DAH2026_본선_방산프로토콜_준비.md 참조
+from rehearsal_web_detectors import (AuthSessionDetector, L3ProductIdDetector,
+                                     McsScriptTraversalDetector, UrlSsrGuardDetector)
 try:
     from protocol_profiles import CCSDS_PROFILE, MAVLINK_PROFILE
 except ImportError:
@@ -92,6 +95,12 @@ MAVLINK_REQUIRE_SIGNED = os.environ.get("DEF_MAVLINK_REQUIRE_SIGNED", "0") == "1
 CCSDS_MODE = os.environ.get("DEF_CCSDS_MODE", "observe").lower()
 RTPS_MODE = os.environ.get("DEF_RTPS_MODE", "observe").lower()
 
+# 리허설 스켈레톤 전용 검사기 설정 — 본선 무관, rehearsal_web_detectors.py 참조
+URL_GUARD_MODE = os.environ.get("DEF_URL_GUARD_MODE", "enforce").lower()
+AUTH_SESSION_MODE = os.environ.get("DEF_AUTH_SESSION_MODE", "enforce").lower()
+MCS_TRAVERSAL_MODE = os.environ.get("DEF_MCS_TRAVERSAL_MODE", "enforce").lower()
+L3_PRODUCT_MODE = os.environ.get("DEF_L3_PRODUCT_MODE", "enforce").lower()
+
 
 def _env_ports(name: str) -> list[int]:
     try:
@@ -103,6 +112,13 @@ def _env_ports(name: str) -> list[int]:
 
 CCSDS_PORTS = _env_ports("DEF_CCSDS_PORTS")
 RTPS_PORTS = _env_ports("DEF_RTPS_PORTS")
+
+# 리허설 스켈레톤 전용 — 본선 무관
+URL_GUARD_PORTS = _env_ports("DEF_URL_GUARD_PORTS") or [8082]
+URL_GUARD_INTERNAL_HOSTS = tuple(
+    host.strip() for host in
+    os.environ.get("DEF_URL_GUARD_INTERNAL_HOSTS", "localhost,helper-box").split(",")
+    if host.strip())
 try:
     CCSDS_SDLS_KEY = bytes.fromhex(os.environ.get("DEF_CCSDS_SDLS_KEY_HEX", "")) or None
 except ValueError:
@@ -154,34 +170,118 @@ def _budget_alarm(_signum, _frame):
     raise _BudgetExceeded()
 
 
-class TcpStreamWindow:
-    """flow별 최근 TCP payload의 단기 보존
+class _FlowBuffer:
+    """단일 flow의 seq 기반 재조립 상태"""
 
-    broker 300ms 계약과 맞지 않는 패킷 보류형 완전 재조립 제외
-    연속 seq의 최근 조각 결합을 통한 현재 조각의 분할 시그니처 탐지
-    TTL/cap/key 상한 기반 메모리 제한과 순서 불일치 시 신규 window 시작
+    __slots__ = ("ts", "base", "assembled", "pending")
+
+    def __init__(self, ts: float, seq: int, payload: bytes) -> None:
+        self.ts = ts
+        self.base = seq
+        self.assembled = bytearray(payload)
+        self.pending: dict[int, bytes] = {}
+
+
+class TcpStreamWindow:
+    """flow별 TCP payload의 seq 기반 단기 재조립
+
+    broker 300ms 계약과 맞지 않는 패킷 보류형 완전 재조립은 하지 않는다.
+    순서가 뒤바뀐 세그먼트를 seq 위치에 보관했다가 빈 구간이 메워지는 순간
+    연속 구간 전체를 반환해 분할·순서 뒤섞기 회피를 탐지한다.
+
+    반환 규칙
+      - 현재 세그먼트가 연속 구간에 편입되면 연속 구간 전체 반환
+      - 빈 구간이 남아 아직 순서가 어긋난 세그먼트는 해당 세그먼트만 반환
+
+    두 번째 규칙은 존재하지 않는 인접성을 만들어내지 않기 위한 오탐 방지다.
+    마지막 빈 구간을 메우는 세그먼트가 도착하는 시점에 요청 전체가 보이므로
+    그 패킷을 DROP하면 요청이 완성되지 않는다. 재전송 세그먼트는 동일한 재조립
+    결과를 만들어 동일하게 DROP되므로 판정이 흔들리지 않는다.
+
+    겹치는 세그먼트는 먼저 도착한 내용을 유지한다. 뒤늦은 덮어쓰기로 탐지 결과를
+    바꾸는 회피를 막기 위한 결정이다.
+
+    TTL·cap·flow 수·세그먼트 수 상한으로 메모리를 제한하며, 상한을 벗어나면
+    현재 세그먼트를 기준으로 재조립을 다시 시작한다.
     """
 
-    def __init__(self, cap=STREAM_WINDOW, ttl=STREAM_TTL, max_flows=4096, now=None):
+    def __init__(self, cap=STREAM_WINDOW, ttl=STREAM_TTL, max_flows=4096,
+                 max_segments=256, now=None):
         self.cap, self.ttl, self.max_flows = max(0, cap), ttl, max_flows
+        self.max_segments = max_segments
         self._now = now or time.monotonic
-        self._flows = {}
+        self._flows: dict = {}
+
+    def _restart(self, flow, now: float, seq: int, payload: bytes) -> bytes:
+        buf = _FlowBuffer(now, seq, payload[:self.cap])
+        self._flows[flow] = buf
+        if len(self._flows) > self.max_flows:
+            stale = sorted(self._flows, key=lambda k: self._flows[k].ts)
+            for key in stale[:len(self._flows) - self.max_flows]:
+                self._flows.pop(key, None)
+        return bytes(buf.assembled)
+
+    @staticmethod
+    def _span(buf: _FlowBuffer) -> int:
+        """현재 보관 중인 구간의 최대 끝 offset"""
+        end = len(buf.assembled)
+        for offset, chunk in buf.pending.items():
+            end = max(end, offset + len(chunk))
+        return end
+
+    @staticmethod
+    def _rebase(buf: _FlowBuffer, back: int) -> None:
+        """base보다 앞선 세그먼트가 도착했을 때 기준점을 뒤로 옮긴다
+
+        기존 연속 구간은 앞이 비었으므로 pending으로 내리고, 새 세그먼트가
+        빈 구간을 메우면 흡수 단계에서 다시 연결된다.
+        """
+        shifted = {offset + back: chunk for offset, chunk in buf.pending.items()}
+        if buf.assembled:
+            shifted[back] = bytes(buf.assembled)
+        buf.pending = shifted
+        buf.assembled = bytearray()
+        buf.base = (buf.base - back) & 0xFFFFFFFF
 
     def add(self, flow, seq, payload: bytes) -> bytes:
         if not self.cap or not flow or seq is None or not payload:
             return payload
         now = self._now()
-        old = self._flows.get(flow)
-        if old and now - old[0] <= self.ttl and seq == old[1]:
-            combined = (old[2] + payload)[-self.cap:]
+        buf = self._flows.get(flow)
+        if buf is None or now - buf.ts > self.ttl:
+            return self._restart(flow, now, seq, payload)
+
+        delta = (seq - buf.base) & 0xFFFFFFFF
+        if delta >= 0x80000000:                   # base보다 앞선 seq
+            back = 0x100000000 - delta
+            if back + self._span(buf) > self.cap:
+                return self._restart(flow, now, seq, payload)
+            self._rebase(buf, back)
+            offset = 0
         else:
-            combined = payload[-self.cap:]
-        self._flows[flow] = (now, (seq + len(payload)) & 0xFFFFFFFF, combined)
-        if len(self._flows) > self.max_flows:
-            stale = sorted(self._flows, key=lambda k: self._flows[k][0])[:len(self._flows)-self.max_flows]
-            for key in stale:
-                self._flows.pop(key, None)
-        return combined
+            offset = delta
+            # 재조립 범위를 벗어나는 간격(연결 재사용·과대 점프)은 새 window 시작
+            if offset + len(payload) > self.cap:
+                return self._restart(flow, now, seq, payload)
+
+        buf.ts = now
+        filled = len(buf.assembled)
+        if offset > filled:                       # 앞에 빈 구간이 남은 조각
+            if len(buf.pending) < self.max_segments:
+                buf.pending.setdefault(offset, payload)
+            return payload
+        if offset + len(payload) > filled:        # 연속 구간 확장(중복 구간은 버림)
+            buf.assembled += payload[filled - offset:]
+            if buf.pending:
+                # offset 오름차순 1회 순회로 인접·부분겹침 조각을 모두 흡수한다
+                for pending_offset in sorted(buf.pending):
+                    end = len(buf.assembled)
+                    if pending_offset > end:
+                        break
+                    chunk = buf.pending.pop(pending_offset)
+                    if pending_offset + len(chunk) > end:
+                        buf.assembled += chunk[end - pending_offset:]
+        return bytes(buf.assembled)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -515,16 +615,81 @@ class VerdictEngine:
 # ════════════════════════════════════════════════════════════════════════════
 #  룰 적재 (외부 signatures.py — 룰 담당)
 # ════════════════════════════════════════════════════════════════════════════
+_IMPLEMENTED_RULE_IDS = {
+    "COM-IP4-001", "COM-IP6-001", "COM-TCP-001", "COM-UDP-001",
+    "SAT-CCSDS-001", "SAT-CCSDS-002", "SAT-CCSDS-004",
+    "SAT-SDLS-001", "SAT-SDLS-002", "MCS-RTPS-001", "MCS-RTPS-003",
+    "UAV-MAV-001", "UAV-MAV-002", "UAV-MAV-003", "UAV-MAV-004",
+    "UAV-MAV-005",
+}
+
+_ALWAYS_ENFORCED_RULE_IDS = {"COM-IP4-001", "COM-UDP-001"}
+
+
+def classify_rule_coverage(signatures_module, active_signature_ids) -> dict:
+    """팀 룰 전체의 실행 가능 상태 집계"""
+    rules = getattr(signatures_module, "DETECTOR_RULES", []) or []
+    active = set(active_signature_ids)
+    supported_protocols = {"IPv4", "IPv6", "TCP", "UDP", "CCSDS SPP",
+                           "CCSDS TC/AOS", "CCSDS SDLS", "DDSI-RTPS",
+                           "MAVLink 1/2", "MAVLink 2", "MAVLink",
+                           "MAVLink Command", "MAVLink Mission"}
+    result = {key: [] for key in (
+        "ENFORCED", "OBSERVED", "IMPLEMENTED_DISABLED",
+        "PREREQUISITE_MISSING", "PARSER_REQUIRED")}
+    for rule in rules:
+        rule_id = str(rule.get("id", ""))
+        protocol = str(rule.get("protocol", ""))
+        detector = str(rule.get("detector", ""))
+        if rule_id in active or rule_id in _ALWAYS_ENFORCED_RULE_IDS:
+            status = "ENFORCED"
+        elif rule_id in _IMPLEMENTED_RULE_IDS:
+            if protocol.startswith("MAVLink"):
+                enabled = MAVLINK_MODE != "off"
+                enforced = enabled and MAVLINK_MODE == "enforce" and bool(MAVLINK_PORTS)
+            elif protocol.startswith("CCSDS"):
+                enabled = CCSDS_MODE != "off"
+                enforced = enabled and CCSDS_MODE == "enforce" and bool(CCSDS_PORTS)
+            elif protocol in {"DDSI-RTPS", "DDS Security"}:
+                enabled = RTPS_MODE != "off"
+                enforced = enabled and RTPS_MODE == "enforce" and bool(RTPS_PORTS)
+            else:
+                enabled, enforced = True, False
+            status = "ENFORCED" if enforced else (
+                "OBSERVED" if enabled else "IMPLEMENTED_DISABLED")
+        elif detector == "ENGINE" or protocol not in supported_protocols:
+            status = "PARSER_REQUIRED"
+        else:
+            status = "PREREQUISITE_MISSING"
+        result[status].append(rule_id)
+    result["TOTAL"] = len(rules)
+    return result
+
+
+def _log_rule_coverage(signatures_module, active_signature_ids) -> None:
+    coverage = classify_rule_coverage(signatures_module, active_signature_ids)
+    logging.info(
+        "rule coverage: total=%d enforced=%d observed=%d disabled=%d "
+        "prerequisite_missing=%d parser_required=%d",
+        coverage["TOTAL"], len(coverage["ENFORCED"]),
+        len(coverage["OBSERVED"]), len(coverage["IMPLEMENTED_DISABLED"]),
+        len(coverage["PREREQUISITE_MISSING"]), len(coverage["PARSER_REQUIRED"]),
+    )
+
+
 def load_engine() -> VerdictEngine:
     """signatures.py의 룰·검사기 설정 기반 엔진 조립
 
     SIGNATURES(텍스트)와 선택적 PARAM_RANGES/RATE_LIMIT 기반 방산 검사기 자동 활성화
     설정 부재 시 ACCEPT-all 안전 기동
     """
-    sigs, wl, extra = [], [], []
+    sigs, wl, extra, signatures_module = [], [], [], None
     try:
         import signatures
+        signatures_module = signatures
         sigs = getattr(signatures, "SIGNATURES", []) or []
+        sigs = [rule for rule in sigs
+                if str(rule.get("id") or rule.get("rule_id")) != "MCS-AUTH-REHEARSAL-001"]
         wl = getattr(signatures, "WHITELIST", []) or []
         param_rules = getattr(signatures, "PARAM_RANGES", None)
         if param_rules:
@@ -551,7 +716,26 @@ def load_engine() -> VerdictEngine:
             sdls_key=CCSDS_SDLS_KEY))
     if RTPS_MODE != "off":
         extra.append(RtpsDetector(mode=RTPS_MODE, ports=RTPS_PORTS))
-    return VerdictEngine.from_config(sigs, wl, extra_detectors=extra)
+    # 리허설 스켈레톤 전용 — 본선 무관, DAH2026_본선_방산프로토콜_준비.md 참조
+    if URL_GUARD_MODE != "off":
+        extra.append(UrlSsrGuardDetector(
+            ports=URL_GUARD_PORTS,
+            internal_hosts=URL_GUARD_INTERNAL_HOSTS,
+            weight=1.0 if URL_GUARD_MODE == "enforce" else 0.0))
+    if AUTH_SESSION_MODE != "off":
+        extra.append(AuthSessionDetector(mode=AUTH_SESSION_MODE))
+    if MCS_TRAVERSAL_MODE != "off":
+        extra.append(McsScriptTraversalDetector(mode=MCS_TRAVERSAL_MODE))
+    if L3_PRODUCT_MODE != "off":
+        extra.append(L3ProductIdDetector(mode=L3_PRODUCT_MODE))
+    engine = VerdictEngine.from_config(sigs, wl, extra_detectors=extra)
+    if signatures_module is not None:
+        _log_rule_coverage(
+            signatures_module,
+            [str(rule.get("id") or rule.get("rule_id") or "SIG-TEXT")
+             for rule in sigs],
+        )
+    return engine
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -803,6 +987,8 @@ def _parse_packet(data: bytes):
 def main_loop(sock, engine: VerdictEngine, analyst: BackgroundAnalyst,
               write_lock: threading.Lock, stop: threading.Event,
               unknown_sampler: UnknownSampler | None = None) -> None:
+    verdict_counts = collections.Counter()
+    rule_counts = collections.Counter()
     while not stop.is_set():
         try:
             data = sock.recv(MAX_PACKET_MSG_SIZE)
@@ -821,9 +1007,24 @@ def main_loop(sock, engine: VerdictEngine, analyst: BackgroundAnalyst,
         pkt_id, pkt_data = parsed
 
         verdict, info = engine.verdict(pkt_data)   # 절대 raise 안 함 (fail-open 내장)
+        verdict_counts["drop" if verdict == VERDICT_DROP else "accept"] += 1
         if info.get("drop"):
-            logging.warning("DROP port=%s reasons=%s sample_sha256=%s",
-                            info.get("dport"), info.get("reasons"), _sample_digest(info))
+            rule_ids = sorted({item.get("rule_id") for item in info.get("evidence", [])
+                               if item.get("drop_eligible") and item.get("rule_id")})
+            for rule_id in rule_ids:
+                rule_counts[rule_id] += 1
+            logging.warning("DEFENDER_EVENT %s", json.dumps({
+                "event": "verdict_drop", "proto": info.get("proto"),
+                "dport": info.get("dport"), "score": info.get("score"),
+                "rule_ids": rule_ids, "sample_sha256": _sample_digest(info),
+            }, ensure_ascii=True, separators=(",", ":")))
+        total_verdicts = verdict_counts["accept"] + verdict_counts["drop"]
+        if total_verdicts % 1000 == 0:
+            logging.info("DEFENDER_EVENT %s", json.dumps({
+                "event": "verdict_summary", "total": total_verdicts,
+                "accept": verdict_counts["accept"], "drop": verdict_counts["drop"],
+                "rule_hits": dict(rule_counts.most_common(20)),
+            }, ensure_ascii=True, separators=(",", ":")))
         if info.get("snippet"):                    # DROP과 약한 의심 모두 분석 후보
             analyst.offer(info)
         elif BG_ANALYSIS and unknown_sampler is not None:

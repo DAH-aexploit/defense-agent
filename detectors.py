@@ -1,8 +1,12 @@
 """검사기 플러그인 — 엔진과 분리된 탐지 로직 모듈
 
 핵심: 프로토콜·공격별 `Detector` 추가를 통한 엔진 순회
-웹 시그니처는 여러 검사기 중 하나(SignatureDetector)로 한정
 당일 pcap 기반 신규 Detector 추가와 특정 프로토콜 종속 배제
+
+이 파일은 본선 방산 프로토콜과 프로토콜 무관 공통 검사기만 담는다.
+리허설 스켈레톤(L1 SSRF·L2 세션 위조·L3 SQLi) 전용 검사기는
+`rehearsal_web_detectors.py`로 분리했다 — 본선과 무관하다는 것이
+`DAH2026_본선_에이전트_구현가이드.md` §5에 명시돼 있다.
 
 내장 검사기:
   - SignatureDetector : 텍스트(HTTP 등) 정규식 시그니처, 정규화(URL/base64/SQL주석) 포함
@@ -32,6 +36,23 @@ _SQL_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _WS_RE = re.compile(r"\s+")
 _B64_RE = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
 _KV_RE = re.compile(r"[?&]([a-z0-9_.\-]+)=([^&\s]+)")
+# 옥탈(\NNN)·hex(\xNN)·유니코드(\uNNNN) 문자 이스케이프 리터럴
+_ESCAPE_RE = re.compile(r"\\(?:([0-7]{3})|x([0-9a-fA-F]{2})|u([0-9a-fA-F]{4}))")
+
+
+def _deescape(value: str) -> str:
+    """문자 이스케이프 리터럴을 실제 문자로 치환
+
+    base64 토큰을 `\\145`(옥탈)·`\\x65`(hex)·`\\u0065`(유니코드) 같은 리터럴로
+    감싸면 base64.b64decode(validate=False)가 백슬래시만 버리고 남은 숫자를
+    base64 문자로 오인해 디코딩 결과가 원문과 어긋난다. 디코딩 전에 이 이스케이프를
+    먼저 해석해 원래 문자로 되돌린다.
+    """
+    def _sub(m: re.Match) -> str:
+        octal, hexd, uni = m.groups()
+        code = int(octal, 8) if octal else int(hexd, 16) if hexd else int(uni, 16)
+        return chr(code)
+    return _ESCAPE_RE.sub(_sub, value)
 
 
 def _b64_expand(text: str) -> str:

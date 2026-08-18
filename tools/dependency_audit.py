@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DAH = ROOT.parent
 DEPLOY = DAH / "deploy" / "agents" / "team1" / "defender"
 APP_FILES = [DEPLOY / "defender.py", DEPLOY / "detectors.py",
+             DEPLOY / "rehearsal_web_detectors.py",
              DEPLOY / "protocol_profiles.py", DEPLOY / "signatures.py"]
 LOCAL_MODULES = {p.stem for p in APP_FILES}
 BANNED = {"tshark", "wireshark", "pyshark", "scapy", "dpkt", "tcpdump"}

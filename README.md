@@ -9,6 +9,9 @@ Linux 커널의 NFQUEUE로 전달된 패킷을 검사해 `ACCEPT` 또는 `DROP`�
 - MAVLink, CCSDS, RTPS / DDS state-aware detectors
 - Optional asynchronous LLM analysis for unknown traffic
 
+> [!IMPORTANT]
+> DAH 대회 실행 노드는 `linux/amd64`다. Apple Silicon Mac에서 플랫폼을 지정하지 않고 빌드하면 `linux/arm64` 이미지가 생성되어 ACR Push는 성공해도 대회 노드에서 적용되지 않는다. 대회 배포에는 일반 `docker build`, 플랫폼 미지정 `docker compose build`, 수동 tag/push를 사용하지 않고 반드시 `make competition-push`를 사용한다.
+
 ## Contents
 
 - [Architecture](#architecture)
@@ -20,6 +23,7 @@ Linux 커널의 NFQUEUE로 전달된 패킷을 검사해 `ACCEPT` 또는 `DROP`�
 - [LLM Analysis](#llm-analysis)
 - [Configuration](#configuration)
 - [Safety Boundaries](#safety-boundaries)
+- [Competition Deployment](#competition-deployment)
 - [Project Structure](#project-structure)
 
 ## Architecture
@@ -113,6 +117,49 @@ docker compose logs -f team1-router team1-defender
 ```
 
 `team1-router`가 NFQUEUE와 broker를 소유하고 `team1-defender`가 공유 Unix socket에 연결한다. 실제 service 이름과 경로는 통합 배포 프로젝트의 `docker-compose.yml`을 기준으로 한다.
+
+## Competition Deployment
+
+대회 레지스트리에 올리는 이미지는 반드시 `linux/amd64` 단일 플랫폼으로 생성한다. `make competition-push`는 다음 절차를 한 번에 수행한다.
+
+- 전체 QA 통과 확인
+- `linux/amd64` 강제 빌드
+- 불필요한 provenance·SBOM manifest 제외
+- ACR `latest` Push
+- `linux/amd64` 지정 재Pull
+- 실제 이미지 OS·아키텍처 검사
+- digest와 생성 시각 출력
+
+```bash
+make competition-push
+```
+
+기본 이미지 주소는 `ligacr.azurecr.io/team9/defender:latest`다. 다른 태그가 필요하면 명시적으로 덮어쓴다.
+
+```bash
+make competition-push \
+  COMPETITION_IMAGE=ligacr.azurecr.io/team9/defender:phase2-backup
+```
+
+이미 올라간 이미지의 플랫폼만 다시 검사하려면 다음 명령을 사용한다.
+
+```bash
+make competition-image-check
+```
+
+배포 후에는 Make 출력의 digest를 기록하고 다음 자동 Pull 이후 에이전트 기동 로그의 버전 식별자와 비교한다. ACR Push 성공만으로 대회 적용 성공을 판단하지 않는다.
+
+### 금지되는 대회 배포 방식
+
+```bash
+# Apple Silicon에서 arm64 이미지가 생성될 수 있는 방식
+docker build -t ligacr.azurecr.io/team9/defender:latest .
+docker compose build team1-defender
+docker tag local-image ligacr.azurecr.io/team9/defender:latest
+docker push ligacr.azurecr.io/team9/defender:latest
+```
+
+위 명령은 로컬 데모 빌드에는 사용할 수 있지만, 그 결과를 대회 레지스트리에 Push하지 않는다.
 
 ## Rules
 
@@ -318,18 +365,24 @@ fail-open은 에이전트 장애가 전체 서비스 중단으로 이어지는 �
 ## Project Structure
 
 ```text
-defender.py             broker runtime, verdict engine, background analyst
-detectors.py            normalization and detector plugins
-protocol_profiles.py     preliminary binary protocol policy profiles
-signatures.py.example   rule configuration example
+defender.py                  broker runtime, verdict engine, background analyst
+detectors.py                 normalization and finals-relevant detector plugins
+rehearsal_web_detectors.py   rehearsal-skeleton-only detectors (SSRF/session/traversal/SQLi
+                              structure guard) — irrelevant to the finals, kept separate so
+                              finals protocol work never has to touch this file
+protocol_profiles.py         preliminary binary protocol policy profiles
+signatures.py.example        rule configuration example
 tests/
-  test_engine.py        unit, safety and broker-contract tests
-  packet_util.py        synthetic raw packet builder
-  qa_replay.py          deterministic PCAP regression
+  test_engine.py             unit, safety and broker-contract tests
+  packet_util.py             synthetic raw packet builder
+  qa_replay.py                deterministic PCAP regression
 tools/
-  bench.py              verdict performance checks
-  pcap_analyze.py       classic PCAP analyzer
-  qa_gate.py            local QA orchestration and evidence
-  dependency_audit.py   deployment dependency policy check
-Makefile                QA command shortcuts
+  bench.py                   verdict performance checks
+  pcap_analyze.py             classic PCAP analyzer
+  round_report.py            round artefact analysis (auto-detects service port)
+  round_watch.py             watches for new round artefacts and analyzes them
+  image_verify.py            verdict checks inside the pushed image
+  qa_gate.py                  local QA orchestration and evidence
+  dependency_audit.py         deployment dependency policy check
+Makefile                     QA and deployment command shortcuts (see `make ship`)
 ```

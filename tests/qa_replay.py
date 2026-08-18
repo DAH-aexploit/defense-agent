@@ -14,9 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from defender import VERDICT_ACCEPT, VERDICT_DROP, load_engine
+from defender import VERDICT_ACCEPT, VERDICT_DROP, VerdictEngine
 from detectors import crc16_ccitt
 from tests.packet_util import build_udp_packet, packet_for, write_pcap
+from tests.rule_fixtures import TEST_SIGNATURES, TEST_WHITELIST
 from tools.pcap_analyze import read_pcap
 
 OUT = ROOT / "qa-results" / "fixtures"
@@ -57,7 +58,7 @@ def fixtures():
 
 def replay(path):
     """PCAP의 신규 engine 순차 적용과 verdict·점수·근거 반환"""
-    engine = load_engine()
+    engine = VerdictEngine.from_config(TEST_SIGNATURES, TEST_WHITELIST)
     return [{"verdict": verdict, "score": round(info.get("score", 0.0), 6),
              "reasons": info["reasons"]}
             for verdict, info in (engine.verdict(packet) for _, packet in read_pcap(str(path)))]
