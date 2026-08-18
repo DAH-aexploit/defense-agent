@@ -12,7 +12,8 @@ import struct
 import sys
 
 sys.path.insert(0, "/app")
-from defender import VERDICT_ACCEPT, VERDICT_DROP, load_engine
+from defender import VERDICT_ACCEPT, VERDICT_DROP, VerdictEngine, load_engine
+from detectors import ModbusDetector
 
 
 def pkt(dport, payload, sport=40001, seq=1):
@@ -50,6 +51,16 @@ def inorder(n):
     return list(range(n))
 
 
+def mbap(pdu, unit=1, tid=1, proto_id=0, length=None):
+    declared = length if length is not None else len(pdu) + 1
+    return struct.pack(">HHHB", tid, proto_id, declared, unit) + pdu
+
+
+# Modbus는 기본 배포에 DEF_MODBUS_PORTS가 비어 있어 load_engine()으로는 검증되지 않는다
+# (MAVLink/CCSDS/RTPS와 동일하게 포트 미확정 상태에서는 의도적으로 비활성).
+# 여기서는 이미지에 클래스가 정상 반영·동작하는지만 별도 엔진으로 확인한다.
+modbus_engine = VerdictEngine([ModbusDetector(mode="enforce", ports=[502])])
+
 e = load_engine()
 checks = [
     ("L1 순서 뒤섞인 분할 SSRF", VERDICT_DROP in feed(ssrf, 8082, shuffle, 41001)),
@@ -64,6 +75,12 @@ checks = [
      == VERDICT_ACCEPT),
     ("L1 정상 /health ACCEPT",
      e.verdict(pkt(8082, b"GET /health HTTP/1.1\r\nHost: t\r\n\r\n", sport=41009))[0]
+     == VERDICT_ACCEPT),
+    ("Modbus 읽기(FC03) ACCEPT",
+     modbus_engine.verdict(pkt(502, mbap(b"\x03\x00\x00\x00\x0a"), sport=41010))[0]
+     == VERDICT_ACCEPT),
+    ("Modbus 쓰기(FC06) 관찰만, DROP 안 함",
+     modbus_engine.verdict(pkt(502, mbap(b"\x06\x00\x01\x00\x2a"), sport=41011))[0]
      == VERDICT_ACCEPT),
 ]
 

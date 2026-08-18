@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from detectors import (CcsdsDetector, Evidence, EvidenceClass,
-                       IdentificationBasis, MavlinkDetector, PacketContext,
+                       IdentificationBasis, MavlinkDetector, ModbusDetector, PacketContext,
                        ParamRangeDetector, RequestBurstDetector, RtpsDetector,
                        SignatureDetector)
 # 리허설 스켈레톤 전용 검사기 — 본선 무관, DAH2026_본선_방산프로토콜_준비.md 참조
@@ -94,6 +94,7 @@ except ValueError:
 MAVLINK_REQUIRE_SIGNED = os.environ.get("DEF_MAVLINK_REQUIRE_SIGNED", "0") == "1"
 CCSDS_MODE = os.environ.get("DEF_CCSDS_MODE", "observe").lower()
 RTPS_MODE = os.environ.get("DEF_RTPS_MODE", "observe").lower()
+MODBUS_MODE = os.environ.get("DEF_MODBUS_MODE", "observe").lower()
 
 # 리허설 스켈레톤 전용 검사기 설정 — 본선 무관, rehearsal_web_detectors.py 참조
 URL_GUARD_MODE = os.environ.get("DEF_URL_GUARD_MODE", "enforce").lower()
@@ -112,6 +113,7 @@ def _env_ports(name: str) -> list[int]:
 
 CCSDS_PORTS = _env_ports("DEF_CCSDS_PORTS")
 RTPS_PORTS = _env_ports("DEF_RTPS_PORTS")
+MODBUS_PORTS = _env_ports("DEF_MODBUS_PORTS")
 
 # 리허설 스켈레톤 전용 — 본선 무관
 URL_GUARD_PORTS = _env_ports("DEF_URL_GUARD_PORTS") or [8082]
@@ -716,6 +718,8 @@ def load_engine() -> VerdictEngine:
             sdls_key=CCSDS_SDLS_KEY))
     if RTPS_MODE != "off":
         extra.append(RtpsDetector(mode=RTPS_MODE, ports=RTPS_PORTS))
+    if MODBUS_MODE != "off":
+        extra.append(ModbusDetector(mode=MODBUS_MODE, ports=MODBUS_PORTS))
     # 리허설 스켈레톤 전용 — 본선 무관, DAH2026_본선_방산프로토콜_준비.md 참조
     if URL_GUARD_MODE != "off":
         extra.append(UrlSsrGuardDetector(

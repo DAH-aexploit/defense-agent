@@ -243,7 +243,7 @@ rate의 기본 scope는 송신·수신 IP, 송신·수신 port와 transport prot
 
 ## Protocol Detectors
 
-MAVLink, CCSDS와 RTPS detector는 `off`, `observe`, `enforce` 모드를 지원한다. `observe`는 탐지와 기록만 수행하고, `enforce`는 탐지 점수를 실제 DROP 판단에 반영한다. 기본 `observe`에서는 weight가 `0`이므로 차단하지 않는다.
+MAVLink, CCSDS, RTPS, Modbus detector는 `off`, `observe`, `enforce` 모드를 지원한다. `observe`는 탐지와 기록만 수행하고, `enforce`는 탐지 점수를 실제 DROP 판단에 반영한다. 기본 `observe`에서는 weight가 `0`이므로 차단하지 않는다.
 
 ```env
 DEF_MAVLINK_MODE=observe
@@ -256,11 +256,15 @@ DEF_CCSDS_PORTS=5111
 
 DEF_RTPS_MODE=observe
 DEF_RTPS_PORTS=7400
+
+DEF_MODBUS_MODE=observe
+DEF_MODBUS_PORTS=502
 ```
 
 - **MAVLink** version, system/component ID, message ID, sequence, signed timestamp와 설정된 `PARAM_SET` 안전 범위 관찰. `COMMAND_LONG`과 `MISSION_ITEM` 핵심 필드 추출 포함. CRC-extra는 message 종류별 checksum 계산에 추가되는 값
 - **CCSDS** primary header, APID, sequence, packet length, 선택적 FECF와 설정된 민감 TC 명령 관찰. 예선 SDLS 프로파일 사용 시 counter replay 및 선택적 HMAC-SHA256 검증 포함. FECF는 전송 오류를 검출하는 frame checksum이며 송신자 인증 기능은 아님
 - **RTPS / DDS** protocol profile, vendor, participant GUID와 submessage boundary 관찰. participant GUID는 DDS 참여자의 식별자이고 submessage boundary는 한 메시지 안의 세부 단위 경계
+- **Modbus/TCP** MBAP(Modbus Application Protocol) header 유효성과 함수 코드 관찰. `TransactionId(2)|ProtocolId(2,=0)|Length(2)|UnitId(1)` 구성의 ProtocolId가 0이 아니면 Modbus로 판단하지 않는다. 선언된 Length와 실제 payload 길이가 정확히 일치할 때만 well-formed 프레임으로 취급한다 — Modbus/TCP는 응답을 기다리지 않고 다음 요청을 연속 전송(pipelining)할 수 있어, 불일치를 곧장 위반으로 판정하면 정상 트래픽을 오탐할 수 있다. 읽기 함수 코드(01/02/03/04/07/0B/0C/11/2B)는 무시하고, 그 외 함수 코드(쓰기·진단)만 관찰 대상으로 기록한다. 정상 제어 트래픽에 쓰기가 포함되는지 확인된 baseline이 없어 `enforce`에서도 차단하지 않는다 — port profile만 요구하는 CCSDS와 달리 이 항목은 baseline 확인 전까지 항상 관찰 전용이다.
 
 현재 MAVLink parser는 프로파일에 등록된 message ID의 CRC-X25와 CRC_EXTRA를 검증한다. 등록되지 않은 message와 본선에서 추가되는 dialect 고유 message는 CRC_EXTRA를 알 수 없으므로 의미 기반 차단 대상으로 사용하지 않는다. CCSDS FECF 역시 무결성 오류를 찾을 뿐 패킷 송신자를 인증하지 않는다.
 
@@ -288,7 +292,7 @@ MAVLink 안전 범위 위반은 CRC-X25와 지원 message의 CRC_EXTRA를 확인
 
 CCSDS `require_sdls`는 민감 명령에 예선 형식의 SDLS trailer를 요구한다. `DEF_CCSDS_SDLS_KEY_HEX`가 설정된 경우에만 HMAC의 암호학적 유효성까지 검증하며, 키가 없으면 trailer 존재와 counter 순서만 검사한다.
 
-MAVLink와 CCSDS는 `enforce`로 설정해도 각각 `DEF_MAVLINK_PORTS`, `DEF_CCSDS_PORTS`의 명시적 port profile이 없으면 Evidence를 DROP 점수에 반영하지 않는다. 본선 port를 확인하기 전에는 기본 `observe`를 유지한다. RTPS는 고유 `RTPS` magic으로 구조 식별이 가능하지만 본선 초기 운영 정책은 동일하게 `observe`다.
+MAVLink와 CCSDS는 `enforce`로 설정해도 각각 `DEF_MAVLINK_PORTS`, `DEF_CCSDS_PORTS`의 명시적 port profile이 없으면 Evidence를 DROP 점수에 반영하지 않는다. 본선 port를 확인하기 전에는 기본 `observe`를 유지한다. RTPS는 고유 `RTPS` magic으로 구조 식별이 가능하지만 본선 초기 운영 정책은 동일하게 `observe`다. Modbus는 고유 magic이 없어 `DEF_MODBUS_PORTS` 없이는 어떤 Evidence도 생성하지 않으며, port를 설정해도 쓰기 함수 코드는 baseline 확인 전까지 계속 관찰 전용이다.
 
 ## LLM Analysis
 
@@ -336,6 +340,8 @@ docker compose logs -f team1-defender | grep DEFENDER_EVENT
 | `DEF_CCSDS_SDLS_KEY_HEX` | 빈 값 | SDLS HMAC 검증용 hex key, 코드나 Git에 저장하지 않음 |
 | `DEF_RTPS_MODE` | `observe` | RTPS detector의 `off`, `observe`, `enforce` 모드 |
 | `DEF_RTPS_PORTS` | 빈 값 | 쉼표로 구분한 RTPS 목적지 포트 profile |
+| `DEF_MODBUS_MODE` | `observe` | Modbus detector의 `off`, `observe`, `enforce` 모드 |
+| `DEF_MODBUS_PORTS` | 빈 값 | 쉼표로 구분한 Modbus 목적지 포트 profile |
 | `DEF_BG_ANALYSIS` | `0` | 백그라운드 LLM 분석 활성화 여부 |
 | `LLM_BASE_URL` | `http://litellm.lig.internal:4000` | OpenAI-compatible gateway 주소 |
 | `LLM_API_KEY` | 빈 값 | gateway 인증 key. 코드나 Git에 저장하지 않음 |

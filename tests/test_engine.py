@@ -27,7 +27,7 @@ from defender import (MSG_HEARTBEAT, MSG_PACKET, MSG_VERDICT, VERDICT_ACCEPT,
                       main_loop)
 from detectors import (BoundedState, CcsdsDetector, Detector, Evidence,
                        EvidenceClass, Hit, IdentificationBasis, MavlinkDetector,
-                       PacketContext, ParamRangeDetector, RateDetector,
+                       ModbusDetector, PacketContext, ParamRangeDetector, RateDetector,
                        RequestBurstDetector,
                        RtpsDetector, SignatureDetector,
                        crc16_ccitt, mavlink_frame_crc, normalize,
@@ -908,6 +908,78 @@ class TestRtpsDetector(unittest.TestCase):
                              VERDICT_ACCEPT)
         self.assertEqual(e.verdict(build_udp_packet(7400, _rtps(guid=b"C" * 12)))[0],
                          VERDICT_DROP)
+
+
+def _mbap(pdu: bytes, unit: int = 1, tid: int = 1, proto_id: int = 0,
+         length: int | None = None) -> bytes:
+    """MBAP(7B) + PDU. length 생략 시 실제 PDU와 일치하는 정상 프레임 생성"""
+    declared = length if length is not None else len(pdu) + 1
+    return struct.pack(">HHHB", tid, proto_id, declared, unit) + pdu
+
+
+class TestModbusDetector(unittest.TestCase):
+    """attack-agent 분석(2026-08-18)에서 발견된 사각지대. 위협 카탈로그·prelim 연구
+    어디에도 없던 프로토콜이며, 우리 자체 공격 에이전트가 P1로 지정해뒀다."""
+
+    def _verdict(self, pdu, mode="observe", ports=(502,), port=502, **kw):
+        e = VerdictEngine([ModbusDetector(mode=mode, ports=ports)])
+        return e.verdict(build_packet(port, _mbap(pdu, **kw)))
+
+    def test_read_holding_registers_accepted_both_modes(self):
+        pdu = b"\x03\x00\x00\x00\x0a"   # FC03 read holding registers
+        for mode in ("observe", "enforce"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self._verdict(pdu, mode=mode)[0], VERDICT_ACCEPT)
+
+    def test_write_single_register_observed_but_not_dropped_in_enforce(self):
+        pdu = b"\x06\x00\x01\x00\x2a"   # FC06 write single register
+        verdict, info = self._verdict(pdu, mode="enforce")
+        self.assertEqual(verdict, VERDICT_ACCEPT)   # baseline 없어 강제 차단 안 함
+        evidence = next(item for item in info["evidence"]
+                        if item["rule_id"] == "MODBUS-WRITE-FC")
+        self.assertFalse(evidence["drop_eligible"])
+
+    def test_write_reported_in_observe_mode(self):
+        pdu = b"\x10\x00\x01\x00\x02\x04\x00\x01\x00\x02"   # FC16 write multiple registers
+        verdict, info = self._verdict(pdu, mode="observe")
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertIn("modbus_non_read_function_code 0x10", info["reasons"])
+
+    def test_exception_response_bit_maps_to_base_function_code(self):
+        pdu = b"\x83\x02"   # FC03 exception response (0x80 | 0x03)
+        self.assertEqual(self._verdict(pdu, mode="observe")[0], VERDICT_ACCEPT)
+        _, info = self._verdict(pdu, mode="observe")
+        self.assertEqual(info["reasons"], [])   # 0x03은 read FC이므로 무보고
+
+    def test_non_zero_protocol_id_ignored(self):
+        pdu = b"\x06\x00\x01\x00\x2a"
+        verdict, info = self._verdict(pdu, mode="observe", proto_id=1)
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertEqual(info["reasons"], [])
+
+    def test_length_mismatch_deferred_not_flagged(self):
+        # 파이프라이닝된 다음 요청이 같은 세그먼트에 섞여 들어온 것처럼 length를 어긋나게
+        pdu = b"\x06\x00\x01\x00\x2a" + b"\x03\x00\x00\x00\x01"
+        verdict, info = self._verdict(pdu, mode="observe", length=6)
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertEqual(info["reasons"], [])
+
+    def test_wrong_port_ignored(self):
+        pdu = b"\x06\x00\x01\x00\x2a"
+        verdict, info = self._verdict(pdu, mode="observe", ports=(502,), port=9999)
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertEqual(info["reasons"], [])
+
+    def test_no_port_profile_produces_no_evidence(self):
+        pdu = b"\x06\x00\x01\x00\x2a"
+        verdict, info = self._verdict(pdu, mode="enforce", ports=())
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertEqual(info["reasons"], [])
+
+    def test_rule_count_reflects_mode(self):
+        self.assertEqual(ModbusDetector(mode="off").rule_count, 0)
+        self.assertEqual(ModbusDetector(mode="observe").rule_count, 1)
+        self.assertEqual(ModbusDetector(mode="enforce").rule_count, 1)
 
 
 class TestQAGates(unittest.TestCase):

@@ -883,3 +883,74 @@ class RtpsDetector(Detector):
         if len({guid for _, guid in q}) > self.max_guids:
             hits.append(self._hit(f"rtps_guid_churn unique>{self.max_guids}"))
         return hits
+
+
+# Modbus/TCP 읽기 함수 코드(우리 자체 attack-agent가 read-only 실행 계획으로 사용하는 목록)
+# FC01/02 read coils/discrete inputs, 03/04 read holding/input registers, 07 read exception
+# status, 0B/0C get comm event counter/log, 11 report server id, 2B encapsulated interface
+_MODBUS_READ_FCS = frozenset({0x01, 0x02, 0x03, 0x04, 0x07, 0x0B, 0x0C, 0x11, 0x2B})
+_MODBUS_EXCEPTION_BIT = 0x80
+
+
+class ModbusDetector(Detector):
+    """Modbus/TCP MBAP 구조 검증과 쓰기 함수 코드 관찰
+
+    83개 위협 카탈로그와 예선 연구(dahAgent/data/techniques.yaml)에 없던 프로토콜.
+    2026-08-18 attack-agent 레포 분석에서 발견 — 우리 팀 공격 에이전트가 스스로
+    "P1, TCP-testable, no CRC"로 지정해 실행 가능 기술로 준비해뒀다(agents/team1/
+    attacker/protocols.py, knowledge.py). L2_MCS·L4_UGV 양쪽에서 ICS 스타일 제어
+    포트로 쓰일 수 있다는 것도 attack-agent의 knowledge.py 자체 코멘트로 확인됨.
+
+    MBAP(Modbus Application Protocol) header 7byte:
+      TransactionId(2,BE) | ProtocolId(2,BE,=0) | Length(2,BE,=1+len(PDU)) | UnitId(1)
+    ProtocolId에 매직 넘버가 없어 이 두 byte가 우연히 0인 다른 프로토콜과 구분할
+    방법이 없다. CCSDS와 동일하게 port profile을 identification 전제조건으로 두어
+    port 설정 전에는 어떤 근거도 생성하지 않는다.
+
+    쓰기 함수 코드(공식 스펙상 05/06/0F/10/16/17 등)는 정상 제어 트래픽인지 공격인지
+    구분할 baseline이 없어 관찰만 한다. 정상 baseline 확인 전 강제 판정 금지 원칙에
+    따라 `enforce`에서도 이 항목은 강제하지 않는다.
+    """
+
+    name = "modbus"
+
+    def __init__(self, mode="observe", ports=None, weight=1.0) -> None:
+        self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
+        self.ports = {int(p) for p in (ports or [])}
+        self.weight = float(weight)
+
+    @property
+    def rule_count(self):
+        return 0 if self.mode == "off" else 1
+
+    def _hit(self, reason, rule_id, actionable=True):
+        enabled = self.mode == "enforce" and actionable
+        return Evidence(
+            self.weight if enabled else 0.0, reason, f"modbus:{rule_id}", rule_id,
+            EvidenceClass.CONTEXT_REQUIRED if enabled else EvidenceClass.OBSERVATION_ONLY,
+            IdentificationBasis.PROFILE_BOUND,
+            bool(self.ports), enabled, True)
+
+    def inspect(self, ctx: PacketContext) -> list[Evidence]:
+        if self.mode == "off" or not self.ports or ctx.proto != 6 or ctx.dport not in self.ports:
+            return []
+        payload = ctx.payload
+        if len(payload) < 8:                        # MBAP(7) + function code(1) 미만
+            return []
+        tid, proto_id, length, unit = struct.unpack(">HHHB", payload[:7])
+        if proto_id != 0:                            # ProtocolId!=0 → Modbus 아님, 판정 보류
+            return []
+        # 선언 Length와 실제 남은 byte 수가 정확히 일치할 때만 well-formed 프레임으로 취급한다.
+        # Modbus/TCP는 응답을 기다리지 않고 여러 요청을 연속 전송(pipelining)할 수 있어,
+        # 불일치를 곧장 구조 위반으로 판정하면 다음 메시지가 섞여 들어온 정상 트래픽을
+        # 오탐할 위험이 있다. CCSDS parser와 동일하게 불일치 시 판정을 보류(빈 목록)한다.
+        pdu = payload[7:]
+        if length != len(pdu) + 1 or not pdu:
+            return []
+        fc = pdu[0] & ~_MODBUS_EXCEPTION_BIT
+        if fc in _MODBUS_READ_FCS:
+            return []
+        # 쓰기·진단 함수 코드는 정상 제어 트래픽인지 공격인지 구분할 baseline이 없어
+        # observe 전용으로 고정한다(actionable=False) — enforce 모드에서도 차단하지 않는다.
+        return [self._hit(f"modbus_non_read_function_code 0x{fc:02x}",
+                          "MODBUS-WRITE-FC", actionable=False)]
