@@ -1294,9 +1294,10 @@ class UdsCanDetector(Detector):
         return hits
 
 
-# IEC 60870-5-104 읽기/심문 type id — attack-agent iec104_read
-#   102 C_RD_NA_1(read), 100 C_IC_NA_1(general interrogation). 제어(45~51 등)는 관찰만.
-_IEC104_READ_TYPES = frozenset({100, 102})
+# IEC 60870-5-104 읽기/심문 type id — attacker-finals iec104.json read_types 기준
+#   100 C_IC_NA_1(general interrogation), 101 C_CI_NA_1(counter interrogation),
+#   102 C_RD_NA_1(read by IOA). 제어(45~51 등)는 관찰만.
+_IEC104_READ_TYPES = frozenset({100, 101, 102})
 
 
 class Iec104Detector(Detector):
