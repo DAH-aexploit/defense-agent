@@ -2,329 +2,178 @@
 
 Deterministic packet defense agent for the DAH NFQUEUE / broker runtime.
 
-Linux 커널의 NFQUEUE로 전달된 패킷을 검사해 `ACCEPT` 또는 `DROP`을 반환한다. 여기서 deterministic은 같은 초기 상태와 같은 패킷 입력에 항상 같은 판정 결과를 반환한다는 의미다.
+Linux 커널의 NFQUEUE로 전달된 인바운드 패킷을 검사해 `ACCEPT`/`DROP`을 반환한다. deterministic은 같은 초기 상태와 같은 입력에 항상 같은 판정을 낸다는 의미다.
 
-- IPv4 / IPv6, TCP / UDP packet inspection
-- Weighted signatures with normalization and independent-evidence quorum
-- MAVLink, CCSDS, RTPS / DDS state-aware detectors
-- Optional asynchronous LLM analysis for unknown traffic
+- IPv4/IPv6, TCP/UDP 패킷 검사, 정규화 + independent-evidence quorum 시그니처
+- 방산 프로토콜 detector: MAVLink · CCSDS · RTPS/DDS · Modbus/TCP · UDS-over-CAN · IEC-104 · SNMP, TLS 채널 관찰
+- 단일-read 구분자 knob: 정상과 구조적으로 다른 공격 read만 차단(Modbus qty · SNMP OID수 · UDS DID · IEC-104 IOA)
+- 미확인 트래픽에 대한 선택적 비동기 LLM 분석
 
-> [!IMPORTANT]
-> DAH 대회 실행 노드는 `linux/amd64`다. Apple Silicon Mac에서 플랫폼을 지정하지 않고 빌드하면 `linux/arm64` 이미지가 생성되어 ACR Push는 성공해도 대회 노드에서 적용되지 않는다. 대회 배포에는 일반 `docker build`, 플랫폼 미지정 `docker compose build`, 수동 tag/push를 사용하지 않고 반드시 `make competition-push`를 사용한다.
+## At a glance
+
+| | |
+|---|---|
+| **역할** | broker가 NFQUEUE로 넘긴 인바운드 패킷을 300ms 안에 `ACCEPT`/`DROP` |
+| **채점** | `(공격 + 방어) × SLA`. 불필요하게 막으면 SLA가 깎이므로 애매하면 `observe` |
+| **인바운드 전용** | 방어자는 서비스로 가는 **요청**만 본다. flag가 실린 **응답은 못 본다**. flag를 읽는 요청을 응답 전에 막는 것이 유일한 수단 |
+| **정책** | read-scan detector 기본 **`enforce`** + 포트 gating. 쓰기·제어·인젝션·TLS는 `observe` |
+| **배포** | 대회 노드는 `linux/amd64`. 배포는 **`make ship` 하나로만** (arm64 무음 미반영 방지) |
+| **예산** | `DEF_BG_ANALYSIS=0`(기본)이면 LLM 호출 없음, 비용 ~$0 |
 
 ## Contents
 
-- [Architecture](#architecture)
-- [Runtime](#runtime)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Rules](#rules)
-- [Protocol Detectors](#protocol-detectors)
-- [LLM Analysis](#llm-analysis)
-- [Configuration](#configuration)
-- [Safety Boundaries](#safety-boundaries)
-- [Competition Deployment](#competition-deployment)
-- [Project Structure](#project-structure)
+[Architecture](#architecture) · [Threat Model](#threat-model) · [Runtime](#runtime) · [Installation](#installation) · [Quick Start](#quick-start) · [Rules](#rules) · [Protocol Detectors](#protocol-detectors) · [LLM Analysis](#llm-analysis) · [Configuration](#configuration) · [Safety Boundaries](#safety-boundaries) · [Competition Deployment](#competition-deployment) · [Project Structure](#project-structure)
 
 ## Architecture
 
-구성 요소의 역할은 다음과 같다.
+- **NFQUEUE**: 커널이 iptables/nftables로 선별한 패킷을 사용자 공간에 전달
+- **broker**: NFQUEUE 패킷을 에이전트에 넘기고 verdict를 커널에 적용하는 중계
+- **defense agent**: 패킷을 검사해 `ACCEPT`/`DROP`을 반환하는 판정 프로그램
+- **detector**: 시그니처·요청률·프로토콜 상태 이상 등 하나의 탐지 기준을 구현한 검사기
 
-- **NFQUEUE** Linux 커널이 iptables/nftables로 선별한 패킷을 사용자 공간 프로그램에 전달하는 기능
-- **broker** NFQUEUE 패킷을 에이전트에 전달하고 에이전트의 verdict를 다시 커널에 적용하는 중계 프로그램
-- **defense agent** broker가 전달한 패킷을 검사해 `ACCEPT` 또는 `DROP`을 반환하는 판정 프로그램
-- **detector** 시그니처, 요청률 또는 프로토콜 상태 이상처럼 하나의 탐지 기준을 구현한 검사기
+에이전트는 Ethernet 없이 IP header부터 시작하는 raw IP packet을 받아 L3/L4 parse로 주소·port·protocol·payload를 분리한다. 각 detector는 문자열이 아니라 룰 ID·근거 등급·식별 근거·선행 조건을 담은 구조화된 `Evidence`를 반환하고, 서로 다른 `source`의 독립 근거만 합산한다(independent-evidence quorum). 기본 DROP 임계값은 `1.0`이며, 같은 탐지의 반복이 아니라 다른 근거가 함께 나올 때 신뢰도가 오른다.
 
-에이전트가 받는 raw IP packet은 Ethernet header 없이 IP header부터 시작한다. L3/L4 parse는 각각 IP 계층과 TCP·UDP 전송 계층의 header를 읽어 주소, port, protocol과 payload를 분리하는 과정이다.
-
-각 detector는 문자열 대신 룰 ID, 근거 등급, 프로토콜 식별 근거와 선행 조건을 포함한 구조화된 `Evidence`를 반환한다. 독립 근거를 합산하는 방식을 independent-evidence quorum이라고 한다. 기본 DROP 임계값은 `1.0`이며, 동일한 `source`의 반복 탐지는 한 번만 반영한다. 같은 탐지의 반복 횟수가 아니라 서로 다른 근거가 함께 발견됐을 때 차단 신뢰도가 높아지는 구조다.
-
-근거 등급은 다음 네 가지다.
-
-- `ATTACK_PATTERN_CONFIRMED` inbound packet에서 공격 패턴 자체가 확인된 근거
-- `VIOLATION_CONFIRMED` 완전한 패킷에서 프로토콜 구조 위반이 확인된 근거
-- `CONTEXT_REQUIRED` 포트·운영 profile·상태 이력 같은 선행 조건이 충족돼야 하는 근거
-- `OBSERVATION_ONLY` 기록과 후속 분석에만 사용하며 DROP 점수에서 제외하는 근거
-
-프로토콜 식별 근거는 `STRUCTURE_VERIFIED`, `PROFILE_BOUND`, `SCHEMA_DEPENDENT`로 구분한다. 각각 패킷 구조만으로 식별 가능한 경우, 포트나 운영 profile이 함께 필요한 경우, 별도 schema나 dialect 정보가 필요한 경우를 의미한다. 식별 또는 선행 조건이 확인되지 않은 Evidence는 weight와 관계없이 DROP 점수에 포함되지 않는다.
+근거 등급: `ATTACK_PATTERN_CONFIRMED`(공격 패턴 확인) · `VIOLATION_CONFIRMED`(구조 위반 확인) · `CONTEXT_REQUIRED`(포트·profile·상태 등 선행 조건 필요) · `OBSERVATION_ONLY`(기록 전용, DROP 점수 제외). 식별·선행 조건이 확인되지 않은 Evidence는 weight와 무관하게 점수에 포함되지 않는다.
 
 ```text
-Network packet
-  → NFQUEUE / broker
-  → L3/L4 parse + structural validation
-  → whitelist
-  → signature + stateful detectors
-  → evidence score
-  → ACCEPT / DROP
-
-Suspicious or unknown sample
-  → bounded background queue
-  → optional LLM analysis
-  → DEFENDER_EVENT log
+Network packet → NFQUEUE/broker → L3/L4 parse + 구조 검증 → whitelist
+              → signature + stateful detectors → evidence score → ACCEPT/DROP
+의심/미확인 표본 → bounded 백그라운드 큐 → (선택) LLM 분석 → DEFENDER_EVENT 로그
 ```
+
+## Threat Model
+
+본선 공격 표면은 방산 프로토콜의 **read-only flag 탈취**다. 공격자는 주소·DID·OID·APID·IOA·topic 공간을 훑어 flag가 실린 값을 읽는다.
+
+방어자는 요청만 보고 응답(flag)은 못 보므로, 대응은 flag를 읽는 **요청**을 응답 전에 막는 것뿐이다. 그래서 승부는 **공격 read가 정상 read와 구분되는가**로 갈린다.
+
+| 구분 | 조건 | 예시 | 대응 |
+|---|---|---|---|
+| ✅ 구분 가능 → 차단 | 공격 read가 정상과 구조적으로 다름 | Modbus qty=16 블록(정상 qty=1), OID·DID·IOA·주소 스윕, SNMP PEN walk | read-scan enforce + 구분자 knob |
+| ❌ 동일 → 구조적 불가 | 공격 read가 정상과 바이트 동일 | UDS VIN `0xF190`, SNMP `sysDescr` 단건 | 차단 불가(flag가 응답에, 인바운드 blind) |
+| ◐ 다운링크 blind | flag가 응답/텔레메트리에 실림 | CCSDS TM, MAVLink MISSION_ITEM, RTPS user DATA | 관찰만(구조적 한계) |
+
+**운영 원칙**: 라운드마다 정상 read baseline 관찰 → 공격 read의 차이 식별 → 해당 [구분자 knob](#protocol-detectors) 설정. SLA가 떨어지면 그 프로토콜만 `DEF_<P>_MODE=observe`로 즉시 롤백.
 
 ## Runtime
 
-broker와 에이전트는 Unix domain `SOCK_SEQPACKET`으로 통신한다. 이 socket은 TCP와 달리 한 번 보낸 메시지의 경계를 보존하므로 broker frame을 정확히 한 단위씩 읽을 수 있다. frame은 broker와 에이전트 사이에서 교환하는 하나의 메시지다.
+broker와 에이전트는 메시지 경계를 보존하는 Unix domain `SOCK_SEQPACKET`으로 frame을 한 단위씩 교환한다.
 
 | frame | 방향 | 내용 |
 |---|---|---|
-| `PACKET` (`0x01`) | broker → agent | packet ID와 raw IP packet |
-| `VERDICT` (`0x02`) | agent → broker | packet ID와 ACCEPT / DROP |
-| `HEARTBEAT` (`0x05`) | agent → broker | 에이전트가 실행 중임을 알리는 주기적 생존 신호 |
+| `PACKET` (`0x01`) | broker → agent | packet ID + raw IP packet |
+| `VERDICT` (`0x02`) | agent → broker | packet ID + ACCEPT/DROP |
+| `HEARTBEAT` (`0x05`) | agent → broker | 주기적 생존 신호 |
 
-### 300ms verdict contract
-
-broker는 패킷을 전달한 뒤 300ms 안에 verdict를 받아 커널에 적용해야 한다. 이 제한은 에이전트가 느려져 전체 네트워크 처리가 정지하는 상황을 막기 위한 runtime 계약이다.
-
-에이전트의 내부 판정 예산은 기본 50ms다. 남은 시간은 broker 통신, process scheduling과 커널 적용 지연을 위한 여유로 둔다. 패킷 처리 순서는 `parse → structural validation → whitelist → detectors → evidence gate → score → verdict`다. 캡처가 잘린 `INCOMPLETE`와 검사 대상이 아닌 `UNSUPPORTED`는 ACCEPT한다. 완전한 패킷에서 확인된 길이·헤더 위반인 `MALFORMED`는 구조 위반 Evidence로 평가한다. detector 예외 또는 판정 예산 초과는 서비스 가용성을 위해 ACCEPT한다.
+broker는 300ms 안에 verdict를 받아 커널에 적용해야 한다(runtime 계약). 에이전트 내부 판정 예산은 기본 50ms이고, 나머지는 통신·스케줄링·적용 지연 여유다. 처리 순서는 `parse → 구조 검증 → whitelist → detectors → evidence gate → score → verdict`. 잘린 캡처(`INCOMPLETE`)·검사 대상 아님(`UNSUPPORTED`)·detector 예외·예산 초과는 가용성을 위해 ACCEPT, 완전한 패킷의 길이·헤더 위반(`MALFORMED`)은 구조 위반 Evidence로 평가한다.
 
 ## Installation
 
-Python >= 3.12. 엔진 코드는 macOS와 Linux에서 확인할 수 있지만 NFQUEUE와 broker를 포함한 실제 packet 처리는 Linux 환경이 필요하다.
+Python >= 3.12. 엔진 코드는 macOS/Linux에서 확인 가능하나 NFQUEUE·broker 실동작은 Linux가 필요하다.
 
 ```bash
 git clone git@github.com:DAH-aexploit/defense-agent.git
 cd defense-agent
-cp signatures.py.example signatures.py
+cp signatures.py.example signatures.py    # 독립 코드 확인용. 실제 실행은 룰 저장소의 signatures.py 사용
 ```
 
-룰 파일은 사용 목적에 따라 다음과 같이 준비한다.
-
-- 독립적인 코드 확인: `signatures.py.example`을 `signatures.py`로 복사
-- 팀 통합 및 실제 실행: 별도 룰 저장소에서 관리하는 `signatures.py` 사용
-- 공통 원칙: 실제 `signatures.py`는 이 저장소에 커밋하지 않음
+`signatures.py`는 별도의 저장소에서 관리된다.
 
 ## Quick Start
 
-### Direct runtime
-
-Linux에서 NFQUEUE와 broker가 먼저 실행되어 `AGENT_SOCKET`의 Unix socket을 생성해야 한다. 에이전트만 단독 실행하면 연결할 broker가 없어 종료된다.
-
 ```bash
+# 단독 실행 (Linux에서 NFQUEUE·broker가 먼저 AGENT_SOCKET을 만든 뒤여야 함)
 AGENT_SOCKET=/run/agent.sock python3 defender.py
-```
 
-### Docker Compose integration
-
-DAH 통합 배포 프로젝트에서는 이 저장소의 `defender.py`, `detectors.py`, `protocol_profiles.py`와 실제 `signatures.py`를 `deploy/agents/team1/defender/`에 반영한 뒤 combat profile로 실행한다.
-
-```bash
+# DAH 통합 배포 (deploy/agents/team1/defender/ 에 반영 후)
 cd ../deploy
-docker compose --profile combat build team1-defender
 docker compose --profile combat up -d team1-router team1-defender
 docker compose logs -f team1-router team1-defender
 ```
 
-`team1-router`가 NFQUEUE와 broker를 소유하고 `team1-defender`가 공유 Unix socket에 연결한다. 실제 service 이름과 경로는 통합 배포 프로젝트의 `docker-compose.yml`을 기준으로 한다.
-
-## Competition Deployment
-
-대회 레지스트리에 올리는 이미지는 반드시 `linux/amd64` 단일 플랫폼으로 생성한다. `make competition-push`는 다음 절차를 한 번에 수행한다.
-
-- 전체 QA 통과 확인
-- `linux/amd64` 강제 빌드
-- 불필요한 provenance·SBOM manifest 제외
-- ACR `latest` Push
-- `linux/amd64` 지정 재Pull
-- 실제 이미지 OS·아키텍처 검사
-- digest와 생성 시각 출력
-
-```bash
-make competition-push
-```
-
-기본 이미지 주소는 `ligacr.azurecr.io/team9/defender:latest`다. 다른 태그가 필요하면 명시적으로 덮어쓴다.
-
-```bash
-make competition-push \
-  COMPETITION_IMAGE=ligacr.azurecr.io/team9/defender:phase2-backup
-```
-
-이미 올라간 이미지의 플랫폼만 다시 검사하려면 다음 명령을 사용한다.
-
-```bash
-make competition-image-check
-```
-
-배포 후에는 Make 출력의 digest를 기록하고 다음 자동 Pull 이후 에이전트 기동 로그의 버전 식별자와 비교한다. ACR Push 성공만으로 대회 적용 성공을 판단하지 않는다.
-
-### 금지되는 대회 배포 방식
-
-```bash
-# Apple Silicon에서 arm64 이미지가 생성될 수 있는 방식
-docker build -t ligacr.azurecr.io/team9/defender:latest .
-docker compose build team1-defender
-docker tag local-image ligacr.azurecr.io/team9/defender:latest
-docker push ligacr.azurecr.io/team9/defender:latest
-```
-
-위 명령은 로컬 데모 빌드에는 사용할 수 있지만, 그 결과를 대회 레지스트리에 Push하지 않는다.
+`team1-router`가 NFQUEUE·broker를 소유하고 `team1-defender`가 공유 Unix socket에 연결한다.
 
 ## Rules
 
-### Signatures
-
-텍스트 룰은 `signatures.py`의 `SIGNATURES`에 작성한다.
+룰은 `signatures.py`에 작성한다.
 
 ```python
 SIGNATURES = [
-    {
-        "port": 8084,
-        "pattern": r"union\s+select",
-        "reason": "SQLi UNION",
-        "weight": 1.0,
-        "target": "both",
-    },
+    {"port": 8084, "pattern": r"union\s+select", "reason": "SQLi UNION", "weight": 1.0, "target": "both"},
 ]
+WHITELIST = [{"port": 8082, "pattern": r"^get /health"}]   # match 시 즉시 ACCEPT
 ```
 
-| 필드 | 필수 | 기본값 | 의미 |
+| `SIGNATURES` 필드 | 필수 | 기본값 | 의미 |
 |---|:---:|---:|---|
 | `pattern` | O | 없음 | Python 정규식 |
-| `id` | X | `SIG-TEXT` | 로그와 Evidence에 기록할 룰 식별자 |
+| `id` | X | `SIG-TEXT` | 로그·Evidence 식별자 |
 | `port` | X | 모든 포트 | 목적지 포트 제한 |
-| `reason` | X | `pattern` 문자열 | 로그 분류명과 독립 근거 식별자 |
-| `weight` | X | `1.0` | 탐지 근거의 가중치 |
-| `target` | X | `both` | `raw`, `norm`, `both` 중 검사 대상 |
+| `reason` | X | `pattern` | 로그 분류명 + 중복 제거용 독립 근거 `source` |
+| `weight` | X | `1.0` | 근거 가중치 |
+| `target` | X | `both` | `raw`/`norm`/`both` 검사 대상 |
 
-`port`를 생략한 룰은 모든 목적지 포트에 적용된다. `reason`은 화면에 표시하는 설명인 동시에 점수 중복을 제거하는 `source` 생성에 사용된다. 서로 다른 룰을 독립 근거로 합산하려면 서로 다른 `reason`을 사용해야 한다.
+정규화는 소문자화·이중 URL decode·SQL comment 제거·Base64 확장·공백 정리를 하며, `(a+)+` 같은 중첩 수량자 룰은 적재 단계에서 거부한다. `port`를 생략하면 전체 포트에 적용되므로 whitelist는 우회 경로가 되지 않게 좁게 지정한다. 서로 다른 룰을 독립 근거로 합산하려면 `reason`을 다르게 둔다.
 
-`target`은 원문 `raw`, 정규화 결과 `norm`, 또는 둘 다 검사하는 `both`만 사용한다. 정규화는 소문자화, 이중 URL decode, SQL comment 제거, Base64 token 확장과 공백 정리를 수행한다. `(a+)+`, `(.*)*` 같은 중첩 수량자는 적재 단계에서 거부한다.
-
-### Whitelist
-
-```python
-WHITELIST = [
-    {"port": 8082, "pattern": r"^get /health"},
-]
-```
-
-| 필드 | 필수 | 기본값 | 의미 |
-|---|:---:|---:|---|
-| `pattern` | O | 없음 | 즉시 ACCEPT할 Python 정규식 |
-| `port` | X | 모든 포트 | 목적지 포트 제한 |
-
-whitelist match는 즉시 ACCEPT된다. `port`를 생략하면 모든 목적지 포트에 적용되므로 공격 traffic의 우회 경로가 되지 않도록 port와 요청 형태를 좁게 지정해야 한다.
-
-### Parameter and Packet Burst Policies
-
-```python
-PARAM_RANGES = {
-    8085: {
-        "gain": (0.0, 0.5, 1.0),  # min, max, weight
-    },
-}
-
-RATE_LIMIT = {
-    "per_sec": 50,
-    "window": 1.0,
-    "weight": 1.0,
-    "scope": "flow",
-    "max_keys": 4096,
-}
-```
-
-`PARAM_RANGES`는 `{목적지 포트: {파라미터 이름: (최솟값, 최댓값, weight)}}` 구조다. 현재 HTTP query 또는 form 형태의 숫자 값만 검사하며, 바이너리 프로토콜의 필드 범위 검사는 별도 detector가 필요하다.
-
-| `RATE_LIMIT` 필드 | 기본값 | 의미 |
-|---|---:|---|
-| `per_sec` | `50.0` | 초당 허용 요청 수 |
-| `window` | `1.0` | 요청 수를 계산할 시간 구간(초) |
-| `weight` | `1.0` | 기준 초과 시 탐지 점수 |
-| `scope` | `flow` | `flow` 또는 `port` 집계 |
-| `max_keys` | `4096` | 메모리에 보존할 상태 key 상한 |
-
-rate의 기본 scope는 송신·수신 IP, 송신·수신 port와 transport protocol을 묶은 `flow`다. 여러 정상 송신자의 traffic이 합산되는 `port` scope는 정상 환경에서 측정한 요청량과 변동 범위인 burst baseline을 확인한 후에만 사용한다.
-
-`RATE_LIMIT`은 운영 인프라의 신규 TCP connection 제한이 아니다. 방어 에이전트에 전달된 packet activity를 세는 `RequestBurstDetector` 설정이며 정상 baseline 확인 전에는 설정하지 않는 것이 기본 정책이다. 기존 룰 파일과의 호환을 위해 설정 이름 `RATE_LIMIT`과 import 별칭 `RateDetector`만 유지한다.
-
-룰 적용 전 실제 TCP/UDP transport와 port, 정상 PCAP의 오탐, 정상 burst, 재연결과 sequence reset을 확인한다. sequence reset은 장비 재시작이나 재연결로 순번이 정상적으로 초기화되는 상황이다. 애매한 단일 신호는 `1.0`으로 즉시 차단하지 않고 서로 다른 근거로 조합한다.
+숫자 파라미터 범위(`PARAM_RANGES = {포트: {이름: (min, max, weight)}}`, 현재 HTTP query/form만)와 패킷 버스트(`RATE_LIMIT`, `RequestBurstDetector`, 기본 scope `flow`)도 룰 파일에서 설정하되, 정상 baseline·오탐·재연결·sequence reset을 확인하기 전에는 켜지 않는다. 애매한 단일 신호는 `1.0`으로 즉시 차단하지 않고 다른 근거와 조합한다.
 
 ## Protocol Detectors
 
-MAVLink, CCSDS, RTPS, Modbus detector는 `off`, `observe`, `enforce` 모드를 지원한다. `observe`는 탐지와 기록만 수행하고, `enforce`는 탐지 점수를 실제 DROP 판단에 반영한다. 기본 `observe`에서는 weight가 `0`이므로 차단하지 않는다.
+각 방산 detector는 `off`/`observe`/`enforce` 모드를 지원한다. `observe`는 탐지·기록만(weight 0), `enforce`는 점수를 DROP 판단에 반영한다.
+
+**정책 (flag 유출 차단 1순위)**: read 열거(스캔) detector 기본은 **`enforce`**이며, 세 안전장치로 오탐을 막는다.
+
+1. **포트 gating**: `DEF_*_PORTS` 미설정 시 Evidence를 만들지 않는다(포트 확인 후 발동).
+2. **surgical**: 스캔을 확장하는(창 안에서 처음 보는 대상을 도입) 요청만 차단한다. 정상 클라이언트의 아는 대상 재조회는 스캔 중에도 통과한다.
+3. **쓰기·제어·인젝션·TLS는 `observe`**: baseline이 없거나(쓰기·제어) 복호화가 불가(TLS)해 차단하지 않는다.
+
+| detector | rule ID(read-scan) | 기본 | 포트 env | 구분자 knob |
+|---|---|---|---|---|
+| MAVLink | `MAV-READ-SCAN`, `MAV-MSGID-PROFILE` | `enforce`* | `DEF_MAVLINK_PORTS` | 없음 (다운링크 blind) |
+| CCSDS | `CCSDS-READ-SCAN` | `enforce`* | `DEF_CCSDS_PORTS` | 없음 (다운링크 blind) |
+| RTPS/DDS | `RTPS-READ-SCAN` | `enforce`* | `DEF_RTPS_PORTS` | 없음 (UDP·다운링크) |
+| Modbus/TCP | `MODBUS-READ-SCAN` | `enforce`* | `DEF_MODBUS_PORTS` | `DEF_MODBUS_MAX_READ_QTY` |
+| UDS-over-CAN | `UDS-READ-SCAN` | `enforce`* | `DEF_UDS_CAN_PORTS` | `DEF_UDS_DID_ALLOWLIST` |
+| IEC-104 | `IEC104-READ-SCAN` | `enforce`* | `DEF_IEC104_PORTS` | `DEF_IEC104_IOA_ALLOWLIST` |
+| SNMP v1/v2c | `SNMP-READ-SCAN` | `enforce`* | `DEF_SNMP_PORTS` | `DEF_SNMP_MAX_OIDS` |
+| TLS 관찰기 | `TLS-CHANNEL-OBS` | `observe` | 없음 (포트 무관) | 없음 (복호화 불가) |
+
+`*` enforce가 기본이지만 포트 env가 비면 미발동. 포트 확인 후에만 실제 차단한다.
+
+**단일-read 구분자 knob** (전부 기본 OFF, 당일 baseline 확인 후 값만 채워 활성):
+
+- `DEF_MODBUS_MAX_READ_QTY=<정상 최대 qty>`: FC01-04 read qty 초과 시 DROP(`MODBUS-READ-QTY`).
+- `DEF_SNMP_MAX_OIDS=<요청당 정상 최대 OID>`: 초과 배치 스윕만 DROP(`SNMP-READ-OIDS`).
+- `DEF_UDS_DID_ALLOWLIST=0xF190,0x0100`: 목록 밖 DID의 RDBI만 DROP(`UDS-READ-DID`). 비면 전체 통과.
+- `DEF_IEC104_IOA_ALLOWLIST=100,101`: 목록 밖 IOA의 C_RD만 DROP(`IEC104-READ-IOA`). 비면 전체 통과.
 
 ```env
-DEF_MAVLINK_MODE=observe
-DEF_MAVLINK_PORTS=14550
-DEF_MAVLINK_REQUIRE_SIGNED=0
-
-DEF_CCSDS_MODE=observe
-DEF_CCSDS_PORTS=5111
-# DEF_CCSDS_SDLS_KEY_HEX=hex-encoded-shared-key
-
-DEF_RTPS_MODE=observe
-DEF_RTPS_PORTS=7400
-
-DEF_MODBUS_MODE=observe
+# 포트 확인 후 (기본 enforce이므로 MODE 생략 가능)
 DEF_MODBUS_PORTS=502
+DEF_UDS_CAN_PORTS=6801
+DEF_IEC104_PORTS=2404
+DEF_SNMP_PORTS=161
+# baseline 확인 후 구분자 knob (선택)
+DEF_MODBUS_MAX_READ_QTY=1
+DEF_UDS_DID_ALLOWLIST=0xF190
 ```
 
-- **MAVLink** version, system/component ID, message ID, sequence, signed timestamp와 설정된 `PARAM_SET` 안전 범위 관찰. `COMMAND_LONG`과 `MISSION_ITEM` 핵심 필드 추출 포함. `PARAM_REQUEST_READ`(msgid 20) 열거 관찰(`MAV-READ-SCAN`) — 짧은 창에서 서로 다른 param 대상을 임계 초과로 조회하면 telemetry-read 탈취 스캔으로 관찰만 기록(차단 없음). **message-ID 프로파일 관찰**(2026-08-20, ocslab MAVLink message-ID sequence 데이터셋 반영) — warmup 동안 flow별 msgid 집합을 자가학습하고 이후 프로파일 밖 msgid 등장(`MAV-MSGID-PROFILE`)·특정 msgid flooding(`MAV-MSGID-RATE`, 룰셋 UAV-MAV-021 방향)을 관찰만 기록. False Injection의 "예상 밖 메시지/증폭" 신호이며 GAN 기반 시퀀스 모델을 baseline 없이 쓸 수 있는 집합+rate 근사로 구현. CRC-extra는 message 종류별 checksum 계산에 추가되는 값
-- **CCSDS** primary header, APID, sequence, packet length, 선택적 FECF와 설정된 민감 TC 명령 관찰. 예선 SDLS 프로파일 사용 시 counter replay 및 선택적 HMAC-SHA256 검증 포함. FECF는 전송 오류를 검출하는 frame checksum이며 송신자 인증 기능은 아님. APID 열거 관찰(`CCSDS-READ-SCAN`) — 서비스 단위 distinct APID가 임계 초과면 flag telemetry를 찾는 `ccsds-tm-read` 스캔으로 관찰만 기록(차단 없음)
-- **RTPS / DDS** protocol profile, vendor, participant GUID와 submessage boundary 관찰. participant GUID는 DDS 참여자의 식별자이고 submessage boundary는 한 메시지 안의 세부 단위 경계. DATA/DATA_FRAG 서브메시지에서 reader/writer 엔티티 ID를 추출해 topic 열거 관찰(`RTPS-READ-SCAN`) — 서비스 단위 distinct writerId(topic)가 임계 초과면 `ros2-topic-read` 스캔으로 관찰만 기록. SPDP discovery(소수 builtin writer 반복)는 무신호
-- **Modbus/TCP** MBAP(Modbus Application Protocol) header 유효성과 함수 코드 관찰. `TransactionId(2)|ProtocolId(2,=0)|Length(2)|UnitId(1)` 구성의 ProtocolId가 0이 아니면 Modbus로 판단하지 않는다. 선언된 Length와 실제 payload 길이가 정확히 일치할 때만 well-formed 프레임으로 취급한다 — Modbus/TCP는 응답을 기다리지 않고 다음 요청을 연속 전송(pipelining)할 수 있어, 불일치를 곧장 위반으로 판정하면 정상 트래픽을 오탐할 수 있다. 읽기 함수 코드(01/02/03/04/07/0B/0C/11/2B) 자체는 위반이 아니지만, 재조립 버퍼의 연속 MBAP 프레임을 훑어 read 대상(fc, 시작주소)을 서비스(dst,dport) 단위로 집계하고 짧은 창에서 distinct 대상이 임계 초과면 주소 공간 스캔으로 관찰만 기록한다(`MODBUS-READ-SCAN`). attack-agent가 P1로 지정한 `modbus-read-regs` 탈취 대응이며, NAT/재접속을 고려해 연결이 아닌 서비스 단위로 묶어 한 연결 파이프라인·재접속·간격 스캔을 모두 포착한다. 정상 반복 폴링(같은 레지스터)은 distinct=1이라 신호가 없다. 쓰기·진단 함수 코드는 정상 제어 트래픽에 포함되는지 확인된 baseline이 없어 `enforce`에서도 차단하지 않는다 — port profile만 요구하는 CCSDS와 달리 이 항목은 baseline 확인 전까지 항상 관찰 전용이다. read 열거 관찰도 `OBSERVATION_ONLY`(weight 0)라 어떤 모드에서도 차단하지 않고 enforce 전환 판단 자료로만 쓴다.
-- **UDS-over-CAN-over-TCP** (2026-08-20 추가, attack-agent origin/main P1 `can_uds_read`) 게이트웨이 프레임(`arb_id(4)|len(1)|UDS PDU`)을 walk하고, 읽기 SID(0x22 RDBI 등)의 DID를 서비스 단위로 집계해 DID 스캔을 관찰만 기록한다(`UDS-READ-SCAN`). 비-read SID(쓰기·루틴)는 관찰만(`UDS-WRITE-SID`). CAN에는 magic이 없어 port profile 필요.
-- **IEC 60870-5-104** (attack-agent P2 `iec104_read`) APCI I-format(`0x68|len|ctrl(4)|ASDU`)을 walk하고, 읽기/심문 type(C_RD_NA_1=102, C_IC_NA_1=100)의 IOA를 집계해 IOA 스캔을 관찰만 기록한다(`IEC104-READ-SCAN`). 제어 명령 type(45~69)은 관찰만(`IEC104-CTRL`). port profile 필요.
-- **SNMP v1/v2c** (attack-agent P2 `snmp_v2c_get`) BER(`SEQUENCE{version, community, PDU}`)를 파싱해, GetRequest/GetNext/GetBulk의 OID를 집계해 OID 스캔을 관찰만 기록한다(`SNMP-READ-SCAN`). SetRequest(0xA3)는 관찰만(`SNMP-SET`). port profile 필요(보통 161).
-- **TLS 채널 관찰기** (`TlsObserveDetector`) ClientHello를 파싱해 버전·SNI·포트를 관찰하고, 해당 포트가 암호화 채널이라 payload 기반 방산 detector가 blind임을 알린다(`TLS-CHANNEL-OBS`). 복호화는 하지 않으며 항상 관찰 전용(차단 없음)·flow당 1회·포트 무관. attack-agent harness가 raw-TLS/https probe(`import ssl`)를 쓰는 데 대한 **상황 인지용** — TLS-wrapped 방산 프로토콜은 구조적으로 payload 탐지가 불가능하므로 대응은 운영 레벨(상류 TLS termination 등) 또는 blind 수용이다.
+배포 후 `make ship` 기동 로그의 `detectors: …`, `distinguisher knobs: …` 두 줄로 포트·knob 반영을 확인한다.
 
-현재 MAVLink parser는 프로파일에 등록된 message ID의 CRC-X25와 CRC_EXTRA를 검증한다. 등록되지 않은 message와 본선에서 추가되는 dialect 고유 message는 CRC_EXTRA를 알 수 없으므로 의미 기반 차단 대상으로 사용하지 않는다. CCSDS FECF 역시 무결성 오류를 찾을 뿐 패킷 송신자를 인증하지 않는다.
-
-프로토콜 의미 검사는 정규식 룰과 분리된 `protocol_profiles.py`에서 설정한다. 아래 값은 예선 `dahAgent`에서 확인한 프로파일이며 본선 값으로 간주하지 않는다. 엔진은 이 파일을 실제 런타임에 읽지만 기본 모드가 `observe`이므로 명시적인 port와 `enforce` 설정 전에는 차단하지 않는다.
-
-```python
-MAVLINK_PROFILE = {
-    "validate_crc": True,
-    "param_ranges": {
-        "EK3_ACC_P_NSE": (0.001, 1.0),
-        "ATC_RAT_PIT_P": (0.0, 0.5),
-    },
-    "dangerous_commands": [176],
-}
-
-CCSDS_PROFILE = {
-    "apids": [0x123],
-    "sensitive_commands": ["DISABLE"],
-    "require_sdls": True,
-    "sdls_trailer_len": 36,
-}
-```
-
-MAVLink 안전 범위 위반은 CRC-X25와 지원 message의 CRC_EXTRA를 확인한 뒤 payload의 `param_value`와 `param_id`를 디코딩한 결과다. MAVLink 2가 생략한 payload 끝의 zero 필드는 message 정의 길이까지 복원한다. 현재 CRC_EXTRA 목록은 예선 탐지 대상인 `PARAM_SET`, `MISSION_ITEM`, `MISSION_COUNT`, `MISSION_CLEAR_ALL`, `COMMAND_INT`, `COMMAND_LONG`에 한정된다.
-
-CCSDS `require_sdls`는 민감 명령에 예선 형식의 SDLS trailer를 요구한다. `DEF_CCSDS_SDLS_KEY_HEX`가 설정된 경우에만 HMAC의 암호학적 유효성까지 검증하며, 키가 없으면 trailer 존재와 counter 순서만 검사한다.
-
-MAVLink와 CCSDS는 `enforce`로 설정해도 각각 `DEF_MAVLINK_PORTS`, `DEF_CCSDS_PORTS`의 명시적 port profile이 없으면 Evidence를 DROP 점수에 반영하지 않는다. 본선 port를 확인하기 전에는 기본 `observe`를 유지한다. RTPS는 고유 `RTPS` magic으로 구조 식별이 가능하지만 본선 초기 운영 정책은 동일하게 `observe`다. Modbus는 고유 magic이 없어 `DEF_MODBUS_PORTS` 없이는 어떤 Evidence도 생성하지 않으며, port를 설정해도 쓰기 함수 코드는 baseline 확인 전까지 계속 관찰 전용이다.
+프로토콜 의미 검사(CRC-X25/CRC_EXTRA, CCSDS FECF·SDLS trailer, MAVLink 파라미터 범위)는 `protocol_profiles.py`에서 설정한다. 값은 예선 프로파일이며 본선 값이 아니다. 등록되지 않은 dialect message는 CRC_EXTRA를 몰라 의미 기반 차단에 쓰지 않고, FECF는 무결성만 확인하며 송신자를 인증하지 않는다.
 
 ## LLM Analysis
 
-OpenAI-compatible은 OpenAI 자체 서비스만이 아니라 동일한 `/v1/chat/completions` 요청 형식을 제공하는 LiteLLM 또는 Azure gateway도 사용할 수 있다는 의미다. endpoint와 API key를 환경변수로 주입하면 미확인 또는 의심 패킷 표본을 비동기로 분석한다.
+`DEF_BG_ANALYSIS=1`이면 미확인·의심 표본을 OpenAI-compatible gateway(LiteLLM/Azure 등)로 비동기 분석한다. 기본은 꺼져 있어 비용 0.
 
 ```env
 DEF_BG_ANALYSIS=1
-DEF_LLM_MODEL=gpt-4.1-mini
+DEF_LLM_MODEL=gpt-4.1-mini            # 허용: gpt-4.1-mini, gpt-4.1
 LLM_BASE_URL=http://litellm-gw:4000
 LLM_API_KEY=your-local-gateway-key
 ```
 
-허용 모델은 `gpt-4.1-mini`와 `gpt-4.1`이다. 제한된 패킷 미리보기만 Base64와 hex로 전달하고, 패킷 내용을 모델 지시문으로 오인하지 않도록 분석 지시를 담은 system prompt와 신뢰할 수 없는 packet data를 분리한다.
-
-응답은 다음 필드만 허용하는 JSON object로 검증한다.
-
-- `protocol_guess`
-- `confidence`
-- `evidence`
-- `detector_idea`
-
-결과, 지연시간과 token usage는 `DEFENDER_EVENT`에 기록된다.
-
-```bash
-docker compose logs -f team1-defender | grep DEFENDER_EVENT
-```
-
-모델 오류, timeout, 잘못된 JSON과 호출량 제한은 verdict에 영향을 주지 않는다. 분석 결과도 자동으로 룰에 반영하지 않는다.
+제한된 미리보기만 Base64/hex로 전달하고, 신뢰할 수 없는 packet data를 system prompt와 분리한다. 응답은 `protocol_guess`·`confidence`·`evidence`·`detector_idea`만 허용하는 JSON으로 검증한다. 모델 오류·timeout·JSON 오류·호출량 제한은 verdict에 영향을 주지 않으며, 결과는 `DEFENDER_EVENT`에 기록될 뿐 자동으로 룰에 반영되지 않는다.
 
 ## Configuration
 
@@ -334,72 +183,58 @@ docker compose logs -f team1-defender | grep DEFENDER_EVENT
 | `DEF_DROP_THRESHOLD` | `1.0` | DROP 점수 임계값 |
 | `DEF_PAYLOAD_CAP` | `16384` | 검사할 payload 최대 byte |
 | `DEF_VERDICT_BUDGET_MS` | `50` | 패킷별 내부 판정 예산 |
-| `DEF_STREAM_WINDOW` | `32768` | flow별 TCP 연속 payload 보존 상한 |
-| `DEF_STREAM_TTL` | `5.0` | TCP window 유지시간(초) |
-| `DEF_MAVLINK_MODE` | `observe` | MAVLink detector의 `off`, `observe`, `enforce` 모드 |
-| `DEF_MAVLINK_PORTS` | 빈 값 | 쉼표로 구분한 MAVLink 목적지 포트 profile |
-| `DEF_MAVLINK_REQUIRE_SIGNED` | `0` | 중요 MAVLink message의 서명 요구 여부 |
-| `DEF_CCSDS_MODE` | `observe` | CCSDS detector의 `off`, `observe`, `enforce` 모드 |
-| `DEF_CCSDS_PORTS` | 빈 값 | 쉼표로 구분한 CCSDS 목적지 포트 profile |
-| `DEF_CCSDS_SDLS_KEY_HEX` | 빈 값 | SDLS HMAC 검증용 hex key, 코드나 Git에 저장하지 않음 |
-| `DEF_RTPS_MODE` | `observe` | RTPS detector의 `off`, `observe`, `enforce` 모드 |
-| `DEF_RTPS_PORTS` | 빈 값 | 쉼표로 구분한 RTPS 목적지 포트 profile |
-| `DEF_MODBUS_MODE` | `observe` | Modbus detector의 `off`, `observe`, `enforce` 모드 |
-| `DEF_MODBUS_PORTS` | 빈 값 | 쉼표로 구분한 Modbus 목적지 포트 profile |
-| `DEF_UDS_CAN_MODE` | `observe` | UDS-over-CAN-over-TCP detector 모드 |
-| `DEF_UDS_CAN_PORTS` | 빈 값 | 쉼표로 구분한 UDS/CAN 게이트웨이 포트 profile |
-| `DEF_IEC104_MODE` | `observe` | IEC 60870-5-104 detector 모드 |
-| `DEF_IEC104_PORTS` | 빈 값 | 쉼표로 구분한 IEC-104 포트 profile(보통 2404) |
-| `DEF_SNMP_MODE` | `observe` | SNMP detector 모드 |
-| `DEF_SNMP_PORTS` | 빈 값 | 쉼표로 구분한 SNMP 포트 profile(보통 161) |
-| `DEF_TLS_MODE` | `observe` | TLS 채널 관찰기 모드(암호화 채널·SNI 관찰, 차단 안 함, 포트 무관) |
-| `DEF_BG_ANALYSIS` | `0` | 백그라운드 LLM 분석 활성화 여부 |
-| `LLM_BASE_URL` | `http://litellm.lig.internal:4000` | OpenAI-compatible gateway 주소 |
-| `LLM_API_KEY` | 빈 값 | gateway 인증 key. 코드나 Git에 저장하지 않음 |
-| `DEF_LLM_MODEL` | `gpt-4.1-mini` | LLM 분석 모델 |
-| `DEF_LLM_TIMEOUT_SECONDS` | `20` | LLM 요청 제한시간(초) |
-| `DEF_LLM_MAX_COMPLETION_TOKENS` | `120` | LLM 최대 출력 token |
-| `DEF_LLM_CALLS_PER_MINUTE` | `6` | 분당 LLM 호출 상한 |
-| `DEF_LLM_CALLS_PER_RUN` | `60` | 실행당 LLM 호출 상한 |
-| `DEF_LLM_PORT_COOLDOWN_SECONDS` | `10` | 동일 protocol·port 재호출 대기시간 |
-| `DEF_LLM_QUEUE_MAX_AGE_SECONDS` | `30` | 분석 대기열 항목 최대 수명 |
-| `DEF_UNKNOWN_SAMPLE_LIMIT` | `24` | 실행당 미확인 표본 상한 |
-| `DEF_UNKNOWN_SAMPLES_PER_PORT` | `2` | protocol·port별 표본 상한 |
+| `DEF_STREAM_WINDOW` / `DEF_STREAM_TTL` | `32768` / `5.0` | flow별 TCP 재조립 window 상한 / 유지시간(초) |
+| `DEF_<P>_MODE` | `enforce` | 방산 detector 모드(`off`/`observe`/`enforce`). `<P>` = `MAVLINK`·`CCSDS`·`RTPS`·`MODBUS`·`UDS_CAN`·`IEC104`·`SNMP` |
+| `DEF_<P>_PORTS` | 빈 값 | 쉼표 구분 목적지 포트 profile. **미설정 시 미발동** |
+| `DEF_MODBUS_MAX_READ_QTY` | `0` | 0=OFF. FC01-04 read의 초과 qty DROP |
+| `DEF_SNMP_MAX_OIDS` | `0` | 0=OFF. 요청당 OID 초과 배치 DROP |
+| `DEF_UDS_DID_ALLOWLIST` | 빈 값 | 정상 DID 목록(예: `0xF190`). 목록 밖 RDBI DROP. 비면 전체 통과 |
+| `DEF_IEC104_IOA_ALLOWLIST` | 빈 값 | 정상 IOA 목록(예: `100,101`). 목록 밖 C_RD DROP. 비면 전체 통과 |
+| `DEF_MAVLINK_REQUIRE_SIGNED` | `0` | 중요 MAVLink message의 서명 요구 |
+| `DEF_CCSDS_SDLS_KEY_HEX` | 빈 값 | SDLS HMAC 검증용 hex key(코드·Git에 저장 안 함) |
+| `DEF_TLS_MODE` | `observe` | TLS 채널 관찰(차단 안 함, 포트 무관) |
+| `DEF_BG_ANALYSIS` | `0` | 백그라운드 LLM 분석 활성화 |
+| `LLM_BASE_URL` / `LLM_API_KEY` / `DEF_LLM_MODEL` | 게이트웨이 / 빈 값 / `gpt-4.1-mini` | LLM 접속·모델 |
+| `DEF_LLM_*` | 코드 참조 | timeout·토큰·호출 상한·쿨다운·표본 상한 등 백그라운드 분석 튜닝 |
 
 ## Safety Boundaries
 
-- 캡처 불완전 packet과 지원하지 않는 protocol은 ACCEPT
-- 완전한 packet의 IPv4·IPv6·TCP·UDP 구조 위반은 Evidence gate와 임계값에 따라 DROP
-- IPv4 / IPv6 fragment는 완전 재조립 없이 ACCEPT
-- TCP는 같은 flow의 연속 sequence만 제한된 window로 결합
-- detector 예외와 verdict timeout은 ACCEPT
-- LLM 지연과 실패는 300ms 안에 verdict를 반환하는 fast path에서 격리
-- 미확인 표본 추출, 크기가 제한된 대기열, 분당 호출과 실행당 호출에 상한 적용
-- packet 원문 대신 제한된 미리보기 또는 SHA-256 식별자를 로그에 기록
+- 불완전 캡처·미지원 protocol·detector 예외·verdict timeout은 ACCEPT (fail-open)
+- 완전한 패킷의 IPv4/IPv6/TCP/UDP 구조 위반은 Evidence gate·임계값에 따라 DROP
+- IP fragment는 완전 재조립 없이 ACCEPT, TCP는 같은 flow 연속 sequence만 제한 window로 결합
+- LLM 지연·실패는 300ms fast path에서 격리, 표본·큐·호출량에 상한 적용
+- 로그에는 packet 원문 대신 제한된 미리보기 또는 SHA-256 식별자만 기록
 
-fail-open은 에이전트 장애가 전체 서비스 중단으로 이어지는 것을 막기 위해 오류가 발생한 패킷을 차단하지 않는 정책이다. 이는 해당 패킷이 검사 없이 통과할 수 있다는 의미이기도 하다. 운영 중 broker 연결, 판정 예산 초과, `analysis_error`와 프로세스 재시작을 함께 모니터링해야 한다.
+fail-open은 에이전트 장애가 서비스 중단으로 번지지 않게 오류 패킷을 차단하지 않는 정책이며, 그만큼 검사 없이 통과할 수 있다. 운영 중 broker 연결·판정 예산 초과·`analysis_error`·프로세스 재시작을 함께 모니터링한다.
+
+## Competition Deployment
+
+배포는 **`make ship` 하나로만** 한다. 개발본 동기화, QA, `linux/amd64` Push, 플랫폼 검증, 이미지 내부 판정 검증, 이력 기록을 한 번에 수행한다.
+
+```bash
+make ship NOTE="R2 modbus/iec104 ports + qty knob"
+# 태그 지정: make ship COMPETITION_IMAGE=ligacr.azurecr.io/team9/defender:phase2-backup
+```
+
+기본 이미지는 `ligacr.azurecr.io/team9/defender:latest`. 배포 후 Make 출력 digest를 기록하고 다음 자동 Pull 이후 기동 로그와 대조한다. **ACR Push 성공만으로 대회 적용 성공을 판단하지 않는다.**
+
+아래는 arm64 이미지를 만들 수 있어 **대회 레지스트리에 쓰지 않는다**(로컬 데모 전용).
+
+```bash
+docker build -t …:latest . ; docker compose build team1-defender
+docker tag local-image …:latest ; docker push …:latest
+```
 
 ## Project Structure
 
 ```text
 defender.py                  broker runtime, verdict engine, background analyst
-detectors.py                 normalization and finals-relevant detector plugins
-rehearsal_web_detectors.py   rehearsal-skeleton-only detectors (SSRF/session/traversal/SQLi
-                              structure guard) — irrelevant to the finals, kept separate so
-                              finals protocol work never has to touch this file
+detectors.py                 normalization + finals 방산 detector plugins
+rehearsal_web_detectors.py   rehearsal-skeleton-only detectors (본선 무관, 분리 보관)
 protocol_profiles.py         preliminary binary protocol policy profiles
 signatures.py.example        rule configuration example
-tests/
-  test_engine.py             unit, safety and broker-contract tests
-  packet_util.py             synthetic raw packet builder
-  qa_replay.py                deterministic PCAP regression
-tools/
-  bench.py                   verdict performance checks
-  pcap_analyze.py             classic PCAP analyzer
-  round_report.py            round artefact analysis (auto-detects service port)
-  round_watch.py             watches for new round artefacts and analyzes them
-  image_verify.py            verdict checks inside the pushed image
-  qa_gate.py                  local QA orchestration and evidence
-  dependency_audit.py         deployment dependency policy check
-Makefile                     QA and deployment command shortcuts (see `make ship`)
+tests/test_engine.py         unit·safety·broker-contract tests
+tools/image_verify.py        pushed image 내부 판정 검증
+tools/qa_gate.py             local QA orchestration (make qa)
+Makefile                     QA·deployment shortcuts (see make ship)
 ```
