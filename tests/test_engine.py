@@ -25,9 +25,9 @@ from defender import (MSG_HEARTBEAT, MSG_PACKET, MSG_VERDICT, VERDICT_ACCEPT,
                       UnknownSampler,
                       VerdictEngine, _validate_llm_result, classify_rule_coverage, heartbeat_loop,
                       load_engine, main_loop)
-from detectors import (BoundedState, CcsdsDetector, Detector, Evidence,
+from detectors import (BoundedState, CcsdsDetector, Detector, DnsDetector, Evidence,
                        EvidenceClass, Hit, Iec104Detector, IdentificationBasis,
-                       MavlinkDetector,
+                       MavlinkDetector, MqttDetector,
                        ModbusDetector, PacketContext, ParamRangeDetector, RateDetector,
                        RequestBurstDetector,
                        RtpsDetector, SignatureDetector, SnmpDetector, TlsObserveDetector,
@@ -1451,6 +1451,89 @@ class TestTlsObserveDetector(unittest.TestCase):
         ch = _tls_client_hello("svc")
         e.verdict(build_packet(8443, ch))
         _, info = e.verdict(build_packet(8443, ch))
+        self.assertEqual(info["reasons"], [])
+
+
+def _mqtt_sub(topics):
+    body = b"\x00\x01"                                  # packet identifier
+    for t in topics:
+        body += len(t).to_bytes(2, "big") + t + b"\x00"   # topic filter + QoS
+    return bytes([0x82, len(body)]) + body
+
+
+def _dns_query(name: bytes):
+    q = b""
+    for lbl in name.split(b"."):
+        q += bytes([len(lbl)]) + lbl
+    return b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + q + b"\x00\x00\x01\x00\x01"
+
+
+class TestMqttDetector(unittest.TestCase):
+    """MQTT SUBSCRIBE topic 열거 (attacker-finals UGV-MQTT)"""
+
+    def test_topic_sweep_dropped_in_enforce(self):
+        det = MqttDetector(mode="enforce", ports=[1883], read_scan_targets=4)
+        e = VerdictEngine([det])
+        verdict = info = None
+        seq = 1
+        for i in range(10):
+            frame = _mqtt_sub([f"sensor/{i}/data".encode()])
+            verdict, info = e.verdict(build_packet(1883, frame, seq=seq))
+            seq += len(frame)
+        self.assertEqual(verdict, VERDICT_DROP)
+        self.assertTrue(any(i["rule_id"] == "MQTT-READ-SCAN" for i in info["evidence"]))
+
+    def test_repeated_topic_passes(self):
+        det = MqttDetector(mode="enforce", ports=[1883], read_scan_targets=4)
+        e = VerdictEngine([det])
+        verdict = None
+        seq = 1
+        for _ in range(20):
+            frame = _mqtt_sub([b"telemetry/status"])
+            verdict, _ = e.verdict(build_packet(1883, frame, seq=seq))
+            seq += len(frame)
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+
+    def test_malformed_vbi_observed(self):
+        e = VerdictEngine([MqttDetector(mode="observe", ports=[1883])])
+        _, info = e.verdict(build_packet(1883, b"\x82\xff\xff\xff\xff\xff"))  # 5-byte VBI = 비정규
+        self.assertTrue(any("mqtt_malformed_vbi" in r for r in info["reasons"]))
+
+    def test_no_port_no_evidence(self):
+        e = VerdictEngine([MqttDetector(mode="enforce", ports=())])
+        _, info = e.verdict(build_packet(1883, _mqtt_sub([b"a/b"])))
+        self.assertEqual(info["reasons"], [])
+
+
+class TestDnsDetector(unittest.TestCase):
+    """DNS QNAME 열거·압축 포인터 루프 (attacker-finals MCS-DNS)"""
+
+    def test_qname_sweep_dropped_in_enforce(self):
+        det = DnsDetector(mode="enforce", ports=[53], read_scan_targets=4)
+        e = VerdictEngine([det])
+        verdict = info = None
+        for i in range(10):
+            verdict, info = e.verdict(build_udp_packet(53, _dns_query(f"h{i}.internal.local".encode())))
+        self.assertEqual(verdict, VERDICT_DROP)
+        self.assertTrue(any(i["rule_id"] == "DNS-READ-SCAN" for i in info["evidence"]))
+
+    def test_repeated_qname_passes(self):
+        e = VerdictEngine([DnsDetector(mode="enforce", ports=[53], read_scan_targets=4)])
+        verdict = None
+        for _ in range(20):
+            verdict, _ = e.verdict(build_udp_packet(53, _dns_query(b"ntp.pool.local")))
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+
+    def test_compression_pointer_loop_observed(self):
+        loop = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + b"\xc0\x0c" + b"\x00\x01\x00\x01"
+        e = VerdictEngine([DnsDetector(mode="observe", ports=[53])])
+        _, info = e.verdict(build_udp_packet(53, loop))
+        self.assertTrue(any("dns_malformed_qname" in r for r in info["reasons"]))
+
+    def test_response_ignored(self):
+        resp = b"\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00" + b"\x01a\x00" + b"\x00\x01\x00\x01"
+        e = VerdictEngine([DnsDetector(mode="enforce", ports=[53])])
+        _, info = e.verdict(build_udp_packet(53, resp))    # QR=1 응답은 검사 안 함
         self.assertEqual(info["reasons"], [])
 
 

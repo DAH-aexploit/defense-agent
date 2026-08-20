@@ -13,7 +13,8 @@ import sys
 
 sys.path.insert(0, "/app")
 from defender import VERDICT_ACCEPT, VERDICT_DROP, VerdictEngine, load_engine
-from detectors import (CcsdsDetector, Iec104Detector, MavlinkDetector, ModbusDetector,
+from detectors import (CcsdsDetector, DnsDetector, Iec104Detector, MavlinkDetector,
+                       ModbusDetector, MqttDetector,
                        RtpsDetector, SnmpDetector, TlsObserveDetector, UdsCanDetector)
 
 
@@ -126,6 +127,16 @@ def mav_msgid_novel_reasons():
         engine.verdict(upkt(14550, mav2(i % 256, [0, 30, 33][i % 3], b"\x00" * 4)))
     _, info = engine.verdict(upkt(14550, mav2(200, 76, b"\x00" * 33)))
     return info.get("reasons", [])
+
+
+def mqtt_sub(topic):
+    body = b"\x00\x01" + len(topic).to_bytes(2, "big") + topic + b"\x00"
+    return bytes([0x82, len(body)]) + body
+
+
+def dns_query(name):
+    q = b"".join(bytes([len(l)]) + l for l in name.split(b"."))
+    return b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + q + b"\x00\x00\x01\x00\x01"
 
 
 def tls_client_hello(sni="finals.svc"):
@@ -264,6 +275,17 @@ checks = [
              pkt(8443, tls_client_hello("finals.svc"))))),
     ("MAVLink msgid 프로파일 밖 인젝션 관찰(차단 안 함)",
      any("mavlink_msgid_novel" in r for r in mav_msgid_novel_reasons())),
+    ("MQTT topic 스캔 enforce+포트 차단",
+     (lambda: (lambda eng, seqs: any(
+         eng.verdict(pkt(1883, mqtt_sub(f"t/{i}".encode()), seq=s))[0] == VERDICT_DROP
+         for i, s in enumerate(seqs)))(
+         VerdictEngine([MqttDetector(mode="enforce", ports=[1883], read_scan_targets=4)]),
+         [1 + i * 12 for i in range(10)]))()),
+    ("DNS qname 스캔 enforce+포트 차단",
+     (lambda: (lambda eng: any(
+         eng.verdict(upkt(53, dns_query(f"h{i}.x.local".encode())))[0] == VERDICT_DROP
+         for i in range(10)))(
+         VerdictEngine([DnsDetector(mode="enforce", ports=[53], read_scan_targets=4)])))()),
     # ── 구분자 knob: 공격 read(정상과 다른) 차단 + 정상 단일 read 통과 (쌍으로 확인) ──
     ("Modbus qty knob: 정상 qty=1 ACCEPT",
      _mb_qty.verdict(pkt(502, mbap(modbus_qty(0, 1)), sport=41013))[0] == VERDICT_ACCEPT),
