@@ -1317,6 +1317,19 @@ class TestIec104Detector(unittest.TestCase):
         _, info = e.verdict(build_packet(2404, _iec104(1, type_id=45, cot=6)))
         self.assertTrue(any("iec104_control_command type=45" in r for r in info["reasons"]))
 
+    def test_counter_interrogation_enumeration_detected(self):
+        # C_CI_NA_1(type 101) 카운터 심문 read도 열거로 관찰돼야 함(attacker-finals read_types)
+        det = Iec104Detector(mode="enforce", ports=[2404], read_scan_targets=4)
+        e = VerdictEngine([det])
+        verdict = info = None
+        seq = 1
+        for ioa in range(10):
+            frame = _iec104(ioa, type_id=101, cot=6)
+            verdict, info = e.verdict(build_packet(2404, frame, seq=seq))
+            seq += len(frame)
+        self.assertEqual(verdict, VERDICT_DROP)
+        self.assertTrue(any(i["rule_id"] == "IEC104-READ-SCAN" for i in info["evidence"]))
+
     def test_non_start_byte_ignored(self):
         e = VerdictEngine([Iec104Detector(mode="observe", ports=[2404])])
         _, info = e.verdict(build_packet(2404, b"\x00" + _iec104(0)))
