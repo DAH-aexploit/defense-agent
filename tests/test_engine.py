@@ -24,12 +24,14 @@ from defender import (MSG_HEARTBEAT, MSG_PACKET, MSG_VERDICT, VERDICT_ACCEPT,
                       VERDICT_DROP, BackgroundAnalyst, ParseStatus, TcpStreamWindow,
                       UnknownSampler,
                       VerdictEngine, _validate_llm_result, classify_rule_coverage, heartbeat_loop,
-                      main_loop)
+                      load_engine, main_loop)
 from detectors import (BoundedState, CcsdsDetector, Detector, Evidence,
-                       EvidenceClass, Hit, IdentificationBasis, MavlinkDetector,
+                       EvidenceClass, Hit, Iec104Detector, IdentificationBasis,
+                       MavlinkDetector,
                        ModbusDetector, PacketContext, ParamRangeDetector, RateDetector,
                        RequestBurstDetector,
-                       RtpsDetector, SignatureDetector,
+                       RtpsDetector, SignatureDetector, SnmpDetector, TlsObserveDetector,
+                       UdsCanDetector,
                        crc16_ccitt, mavlink_frame_crc, normalize,
                        parse_ccsds_packet, parse_mavlink_frames,
                        parse_rtps_message)
@@ -754,6 +756,69 @@ class TestMavlinkDetector(unittest.TestCase):
         self.assertIn("mavlink_param_out_of_range", info["reasons"][0])
         self.assertEqual(info["score"], 0.0)
 
+    @staticmethod
+    def _param_read(param_index, seq=1):
+        # PARAM_REQUEST_READ(msgid 20): <hBB16s = index, target_sys, target_comp, param_id
+        payload = struct.pack("<hBB16s", param_index, 1, 1, b"\x00" * 16)
+        return build_udp_packet(14550, _mav2(seq=seq, msgid=20, payload=payload))
+
+    def test_single_param_read_leaves_no_signal(self):
+        e = VerdictEngine([MavlinkDetector(mode="observe", ports=[14550])])
+        _, info = e.verdict(self._param_read(0))
+        self.assertEqual(info["reasons"], [])
+
+    def test_param_read_sweep_reported_as_enumeration_observe_only(self):
+        # attack-agent mavlink-telemetry-read: param 공간을 훑는 READ 스캔 → 관찰만
+        det = MavlinkDetector(mode="enforce", ports=[14550], param_read_scan=4)
+        e = VerdictEngine([det])
+        verdict = info = None
+        for idx in range(10):
+            verdict, info = e.verdict(self._param_read(idx, seq=idx + 1))
+        self.assertEqual(verdict, VERDICT_DROP)   # enforce+포트: telemetry-read 스캔 차단
+        evidence = next(item for item in info["evidence"]
+                        if item["rule_id"] == "MAV-READ-SCAN")
+        self.assertTrue(evidence["drop_eligible"])
+        self.assertIn("mavlink_param_read_enumeration", evidence["reason"])
+
+    def test_msgid_profile_flags_novel_after_warmup(self):
+        # ocslab MAVLink 데이터셋: 정상 미션은 안정된 msgid 집합, 인젝션은 예상 밖 msgid.
+        det = MavlinkDetector(mode="observe", ports=[14550], msgid_warmup=6,
+                              msgid_rate_limit=1000)
+        e = VerdictEngine([det])
+        info = None
+        for i in range(12):                              # warmup 동안 msgid {0,30,33}만 학습
+            info = e.verdict(build_udp_packet(
+                14550, _mav2(seq=i % 256, msgid=[0, 30, 33][i % 3], payload=b"\x00" * 4)))[1]
+        self.assertFalse(any("msgid_novel" in r for r in info["reasons"]))   # 학습된 집합은 무신호
+        # 인젝션: 프로파일 밖 msgid 76(COMMAND_LONG)
+        verdict, info = e.verdict(build_udp_packet(
+            14550, _mav2(seq=200, msgid=76, payload=b"\x00" * 33)))
+        self.assertEqual(verdict, VERDICT_ACCEPT)        # 관찰만, 차단 안 함
+        self.assertTrue(any("mavlink_msgid_novel msgid=76" in r for r in info["reasons"]))
+
+    def test_msgid_flood_observed_once_per_window(self):
+        det = MavlinkDetector(mode="observe", ports=[14550], msgid_warmup=1000,
+                              msgid_rate_limit=20)
+        e = VerdictEngine([det])
+        reasons = []
+        for i in range(40):
+            _, info = e.verdict(build_udp_packet(
+                14550, _mav2(seq=i % 256, msgid=30, payload=bytes([i % 250 + 1]))))
+            reasons.extend(info["reasons"])
+        floods = [r for r in reasons if "mavlink_msgid_flood" in r]
+        self.assertEqual(len(floods), 1)                 # 창당 1회만 보고
+        self.assertIn("msgid=30", floods[0])
+
+    def test_msgid_profile_evidence_is_observation_only(self):
+        det = MavlinkDetector(mode="enforce", ports=[14550], msgid_warmup=2,
+                              msgid_rate_limit=1000)
+        e = VerdictEngine([det])
+        for i in range(4):
+            e.verdict(build_udp_packet(14550, _mav2(seq=i, msgid=0, payload=b"\x00" * 4)))
+        _, info = e.verdict(build_udp_packet(14550, _mav2(seq=9, msgid=76, payload=b"\x00" * 33)))
+        evidence = next(i for i in info["evidence"] if i["rule_id"] == "MAV-MSGID-PROFILE")
+        self.assertFalse(evidence["drop_eligible"])       # enforce여도 차단 안 함
+
     def test_command_long_profile_decodes_command_id(self):
         payload = struct.pack("<7fHBBB", *(0.0,) * 7, 176, 1, 1, 0)
         detector = MavlinkDetector(
@@ -880,11 +945,38 @@ class TestCcsdsDetector(unittest.TestCase):
         self.assertEqual(VerdictEngine([detector]).verdict(
             build_udp_packet(5111, _ccsds_sdls(payload=b"STATUS")))[0], VERDICT_ACCEPT)
 
+    def test_apid_sweep_reported_as_enumeration_observe_only(self):
+        # attack-agent ccsds-tm-read: flag telemetry를 찾으려 APID 공간을 훑는 스캔
+        det = CcsdsDetector(mode="enforce", ports=[10000], apid_scan_targets=4)
+        e = VerdictEngine([det])
+        verdict = info = None
+        for apid in range(10):
+            verdict, info = e.verdict(build_udp_packet(10000, _ccsds(seq=apid, apid=100 + apid)))
+        self.assertEqual(verdict, VERDICT_DROP)   # enforce+포트: APID 스캔 차단
+        evidence = next(item for item in info["evidence"]
+                        if item["rule_id"] == "CCSDS-READ-SCAN")
+        self.assertTrue(evidence["drop_eligible"])
+
+    def test_repeated_apid_is_not_enumeration(self):
+        det = CcsdsDetector(mode="observe", ports=[10000], apid_scan_targets=4)
+        e = VerdictEngine([det])
+        info = None
+        for i in range(20):
+            _, info = e.verdict(build_udp_packet(10000, _ccsds(seq=i, apid=42)))
+        self.assertFalse(any("ccsds_apid_enumeration" in r for r in info["reasons"]))
+
 
 def _rtps(guid=b"G" * 12, version=(2, 3), vendor=b"\x01\x0f", malformed=False):
     header = b"RTPS" + bytes(version) + vendor + guid
     size = 99 if malformed else 1
     return header + bytes([0x15, 0x01]) + size.to_bytes(2, "little") + b"x"
+
+
+def _rtps_data(writer_id, reader_id=b"RRRR", guid=b"G" * 12):
+    # DATA(0x15) 서브메시지: extraFlags(2) octetsToInlineQos(2) readerId(4) writerId(4) writerSN(8)
+    header = b"RTPS" + bytes((2, 3)) + b"\x01\x0f" + guid
+    body = b"\x00\x00" + b"\x00\x00" + reader_id + writer_id + b"\x00" * 8
+    return header + bytes([0x15, 0x01]) + len(body).to_bytes(2, "little") + body
 
 
 class TestRtpsDetector(unittest.TestCase):
@@ -908,6 +1000,30 @@ class TestRtpsDetector(unittest.TestCase):
                              VERDICT_ACCEPT)
         self.assertEqual(e.verdict(build_udp_packet(7400, _rtps(guid=b"C" * 12)))[0],
                          VERDICT_DROP)
+
+    def test_parser_extracts_data_endpoints(self):
+        msg = parse_rtps_message(_rtps_data(b"\x00\x00\x01\x03"))
+        self.assertEqual(msg.endpoints, ((b"RRRR", b"\x00\x00\x01\x03"),))
+
+    def test_topic_sweep_reported_as_enumeration_observe_only(self):
+        # attack-agent ros2-topic-read: flag 담은 topic을 찾으려 여러 writerId를 훑는 스캔
+        det = RtpsDetector(mode="enforce", ports=[7400], topic_scan=4)
+        e = VerdictEngine([det])
+        verdict = info = None
+        for t in range(10):
+            verdict, info = e.verdict(build_udp_packet(7400, _rtps_data(bytes([0, 0, t, 0x03]))))
+        self.assertEqual(verdict, VERDICT_DROP)   # enforce+포트: topic 스캔 차단
+        evidence = next(item for item in info["evidence"]
+                        if item["rule_id"] == "RTPS-READ-SCAN")
+        self.assertTrue(evidence["drop_eligible"])
+
+    def test_repeated_topic_is_not_enumeration(self):
+        det = RtpsDetector(mode="observe", ports=[7400], topic_scan=4)
+        e = VerdictEngine([det])
+        info = None
+        for _ in range(20):
+            _, info = e.verdict(build_udp_packet(7400, _rtps_data(b"\x00\x00\x01\x03")))
+        self.assertFalse(any("rtps_topic_enumeration" in r for r in info["reasons"]))
 
 
 def _mbap(pdu: bytes, unit: int = 1, tid: int = 1, proto_id: int = 0,
@@ -981,6 +1097,262 @@ class TestModbusDetector(unittest.TestCase):
         self.assertEqual(ModbusDetector(mode="observe").rule_count, 1)
         self.assertEqual(ModbusDetector(mode="enforce").rule_count, 1)
 
+    @staticmethod
+    def _read(addr):
+        return b"\x03" + addr.to_bytes(2, "big") + b"\x00\x01"   # FC03 read 1 reg @addr
+
+    def test_single_read_leaves_no_signal(self):
+        # 단일 read는 정상 폴링과 구분 불가 — 근거를 남기지 않는다
+        _, info = self._verdict(b"\x03\x00\x00\x00\x0a", mode="observe")
+        self.assertEqual(info["reasons"], [])
+
+    def test_repeated_same_register_read_is_not_enumeration(self):
+        # 같은 레지스터를 반복 폴링하는 정상 트래픽은 distinct 대상이 1이라 스캔이 아니다
+        det = ModbusDetector(mode="observe", ports=[502], read_scan_targets=4)
+        e = VerdictEngine([det])
+        seq = 1
+        for _ in range(30):
+            frame = _mbap(b"\x03\x00\x00\x00\x0a")
+            _, info = e.verdict(build_packet(502, frame, seq=seq))
+            seq += len(frame)
+        self.assertEqual(info["reasons"], [])
+
+    def test_pipelined_address_sweep_reported_observe_only(self):
+        # attack-agent modbus-read-regs: 한 연결에서 연속 read로 주소 공간을 훑는 스캔.
+        # 연속 seq라 재조립되지만, 프레임을 훑어 집계 → 관찰만(차단 없음).
+        det = ModbusDetector(mode="enforce", ports=[502], read_scan_targets=4)
+        e = VerdictEngine([det])
+        verdict = info = None
+        seq = 1
+        for addr in range(10):
+            frame = _mbap(self._read(addr))
+            verdict, info = e.verdict(build_packet(502, frame, seq=seq))
+            seq += len(frame)
+        self.assertEqual(verdict, VERDICT_DROP)   # enforce+포트: 스캔 차단(flag 유출 방지)
+        evidence = next(item for item in info["evidence"]
+                        if item["rule_id"] == "MODBUS-READ-SCAN")
+        self.assertTrue(evidence["drop_eligible"])
+        self.assertIn("modbus_read_enumeration", evidence["reason"])
+
+    def test_scan_observed_not_dropped_in_observe_mode(self):
+        det = ModbusDetector(mode="observe", ports=[502], read_scan_targets=4)
+        e = VerdictEngine([det])
+        verdict = info = None
+        seq = 1
+        for addr in range(10):
+            frame = _mbap(self._read(addr))
+            verdict, info = e.verdict(build_packet(502, frame, seq=seq))
+            seq += len(frame)
+        self.assertEqual(verdict, VERDICT_ACCEPT)   # observe는 관찰만
+        self.assertTrue(any("modbus_read_enumeration" in r for r in info["reasons"]))
+
+    def test_surgical_known_reads_pass_during_active_scan(self):
+        # 프로토콜 통째 차단이 아니라 스캔을 확장하는 요청만 차단: 스캔 진행 중에도 정상
+        # 클라이언트가 아는 레지스터를 재조회하는 요청은 통과한다.
+        det = ModbusDetector(mode="enforce", ports=[502], read_scan_targets=4)
+        e = VerdictEngine([det])
+        seq = 1
+
+        def rd(addr, sport):
+            nonlocal seq
+            v, _ = e.verdict(build_packet(502, _mbap(self._read(addr)), seq=seq, sport=sport))
+            seq += 12
+            return v
+        rd(0, 40001)                                  # 정상 클라가 레지스터 0을 학습
+        for a in range(1, 12):                        # 공격 스캔이 임계를 넘김
+            rd(0x1000 + a, 41001)
+        self.assertEqual(rd(0x2000, 41001), VERDICT_DROP)    # 새 주소 스캔 read → 차단
+        self.assertEqual(rd(0, 40001), VERDICT_ACCEPT)       # 아는 레지스터 재조회 → 통과
+
+    def test_reconnect_sweep_aggregated_by_service(self):
+        # NAT/재접속: 연결마다 sport가 달라도 서비스(dst,dport) 단위로 스캔을 집계한다
+        det = ModbusDetector(mode="observe", ports=[502], read_scan_targets=4)
+        e = VerdictEngine([det])
+        info = None
+        for addr in range(10):
+            _, info = e.verdict(build_packet(502, _mbap(self._read(addr)), sport=40001 + addr))
+        self.assertTrue(any("modbus_read_enumeration" in r for r in info["reasons"]))
+
+
+# ── 2026-08-20 attack-agent origin/main 신규 프로토콜(UDS/CAN·IEC-104·SNMP) ──
+def _uds_can(pdu, arb=0x7DF):
+    return struct.pack(">IB", arb & 0x1FFFFFFF, len(pdu) & 0xFF) + pdu
+
+
+def _uds_rdbi(did):
+    return b"\x22" + struct.pack(">H", did)         # ReadDataByIdentifier(0x22) + DID
+
+
+def _iec104(ioa, ca=1, type_id=102, cot=5):
+    asdu = bytes([type_id, 0x01]) + struct.pack("<H", cot) + struct.pack("<H", ca) \
+        + (ioa & 0xFFFFFF).to_bytes(3, "little")
+    return bytes([0x68, 4 + len(asdu)]) + b"\x00\x00\x00\x00" + asdu
+
+
+def _ber(tag, val):
+    return bytes([tag, len(val)]) + val             # short-form(길이<128) 전용 테스트 헬퍼
+
+
+def _ber_oid(arcs):
+    body = bytes([arcs[0] * 40 + arcs[1]])
+    for a in arcs[2:]:
+        if a < 128:
+            body += bytes([a])
+        else:
+            s = [a & 0x7F]
+            a >>= 7
+            while a:
+                s.insert(0, (a & 0x7F) | 0x80)
+                a >>= 7
+            body += bytes(s)
+    return _ber(0x06, body)
+
+
+def _snmp_get(oid, pdu_tag=0xA0, community=b"public"):
+    vb = _ber(0x30, _ber_oid(oid) + _ber(0x05, b""))
+    pdu = _ber(pdu_tag, _ber(0x02, b"\x01") + _ber(0x02, b"\x00") + _ber(0x02, b"\x00")
+               + _ber(0x30, vb))
+    return _ber(0x30, _ber(0x02, b"\x01") + _ber(0x04, community) + pdu)
+
+
+class TestUdsCanDetector(unittest.TestCase):
+    """UDS-over-CAN-over-TCP (attack-agent origin/main P1: can_uds_read)"""
+
+    def test_single_read_leaves_no_signal(self):
+        e = VerdictEngine([UdsCanDetector(mode="observe", ports=[6801])])
+        _, info = e.verdict(build_packet(6801, _uds_can(_uds_rdbi(0xF190))))
+        self.assertEqual(info["reasons"], [])
+
+    def test_did_sweep_reported_observe_only(self):
+        det = UdsCanDetector(mode="enforce", ports=[6801], read_scan_targets=4)
+        e = VerdictEngine([det])
+        verdict = info = None
+        seq = 1
+        for did in range(10):
+            frame = _uds_can(_uds_rdbi(0xF000 + did))
+            verdict, info = e.verdict(build_packet(6801, frame, seq=seq))
+            seq += len(frame)
+        self.assertEqual(verdict, VERDICT_DROP)   # enforce+포트: 스캔 차단
+        evidence = next(i for i in info["evidence"] if i["rule_id"] == "UDS-READ-SCAN")
+        self.assertTrue(evidence["drop_eligible"])
+
+    def test_write_sid_observed_not_dropped(self):
+        det = UdsCanDetector(mode="enforce", ports=[6801])
+        e = VerdictEngine([det])
+        verdict, info = e.verdict(build_packet(6801, _uds_can(b"\x2e\xf1\x90\x01")))  # WriteDataByIdentifier
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertTrue(any("uds_non_read_sid 0x2e" in r for r in info["reasons"]))
+
+    def test_no_port_profile_no_evidence(self):
+        e = VerdictEngine([UdsCanDetector(mode="enforce", ports=())])
+        _, info = e.verdict(build_packet(6801, _uds_can(_uds_rdbi(0xF190))))
+        self.assertEqual(info["reasons"], [])
+
+
+class TestIec104Detector(unittest.TestCase):
+    """IEC 60870-5-104 (attack-agent origin/main P2: iec104_read)"""
+
+    def test_single_read_leaves_no_signal(self):
+        e = VerdictEngine([Iec104Detector(mode="observe", ports=[2404])])
+        _, info = e.verdict(build_packet(2404, _iec104(0)))
+        self.assertEqual(info["reasons"], [])
+
+    def test_ioa_sweep_reported_observe_only(self):
+        det = Iec104Detector(mode="enforce", ports=[2404], read_scan_targets=4)
+        e = VerdictEngine([det])
+        verdict = info = None
+        seq = 1
+        for ioa in range(10):
+            frame = _iec104(ioa)
+            verdict, info = e.verdict(build_packet(2404, frame, seq=seq))
+            seq += len(frame)
+        self.assertEqual(verdict, VERDICT_DROP)   # enforce+포트: 스캔 차단
+        evidence = next(i for i in info["evidence"] if i["rule_id"] == "IEC104-READ-SCAN")
+        self.assertTrue(evidence["drop_eligible"])
+
+    def test_control_command_observed_not_dropped(self):
+        det = Iec104Detector(mode="enforce", ports=[2404])
+        e = VerdictEngine([det])
+        # type 45 = C_SC_NA_1 single command (제어)
+        _, info = e.verdict(build_packet(2404, _iec104(1, type_id=45, cot=6)))
+        self.assertTrue(any("iec104_control_command type=45" in r for r in info["reasons"]))
+
+    def test_non_start_byte_ignored(self):
+        e = VerdictEngine([Iec104Detector(mode="observe", ports=[2404])])
+        _, info = e.verdict(build_packet(2404, b"\x00" + _iec104(0)))
+        self.assertEqual(info["reasons"], [])
+
+
+class TestSnmpDetector(unittest.TestCase):
+    """SNMP v2c (attack-agent origin/main P2: snmp_v2c_get)"""
+
+    def test_single_get_leaves_no_signal(self):
+        e = VerdictEngine([SnmpDetector(mode="observe", ports=[161])])
+        _, info = e.verdict(build_udp_packet(161, _snmp_get((1, 3, 6, 1, 2, 1, 1, 1))))
+        self.assertEqual(info["reasons"], [])
+
+    def test_oid_sweep_reported_observe_only(self):
+        det = SnmpDetector(mode="enforce", ports=[161], read_scan_targets=4)
+        e = VerdictEngine([det])
+        verdict = info = None
+        for i in range(10):
+            verdict, info = e.verdict(build_udp_packet(161, _snmp_get((1, 3, 6, 1, 2, 1, 1, i + 1))))
+        self.assertEqual(verdict, VERDICT_DROP)   # enforce+포트: 스캔 차단
+        evidence = next(i for i in info["evidence"] if i["rule_id"] == "SNMP-READ-SCAN")
+        self.assertTrue(evidence["drop_eligible"])
+
+    def test_set_request_observed_not_dropped(self):
+        det = SnmpDetector(mode="enforce", ports=[161])
+        e = VerdictEngine([det])
+        verdict, info = e.verdict(build_udp_packet(161, _snmp_get((1, 3, 6, 1), pdu_tag=0xA3)))
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertTrue(any("snmp_set_request" in r for r in info["reasons"]))
+
+    def test_non_snmp_ber_ignored(self):
+        e = VerdictEngine([SnmpDetector(mode="observe", ports=[161])])
+        _, info = e.verdict(build_udp_packet(161, b"not-ber-data"))
+        self.assertEqual(info["reasons"], [])
+
+
+def _tls_client_hello(sni="finals.svc"):
+    name = sni.encode()
+    server_name = b"\x00" + len(name).to_bytes(2, "big") + name
+    snl = len(server_name).to_bytes(2, "big") + server_name
+    ext = b"\x00\x00" + len(snl).to_bytes(2, "big") + snl
+    exts = len(ext).to_bytes(2, "big") + ext
+    body = b"\x03\x03" + b"\x00" * 32 + b"\x00" + b"\x00\x02\x00\x2f" + b"\x01\x00" + exts
+    hs = b"\x01" + len(body).to_bytes(3, "big") + body
+    return b"\x16\x03\x03" + len(hs).to_bytes(2, "big") + hs
+
+
+class TestTlsObserveDetector(unittest.TestCase):
+    """TLS 채널 관찰 — 암호화로 payload 기반 detector가 blind인 지점을 표시(차단 안 함)"""
+
+    def test_client_hello_parsed_with_sni(self):
+        from detectors import parse_tls_client_hello
+        version, sni = parse_tls_client_hello(_tls_client_hello("ugv-gw.finals"))
+        self.assertEqual(version, (3, 3))
+        self.assertEqual(sni, "ugv-gw.finals")
+
+    def test_non_tls_ignored(self):
+        from detectors import parse_tls_client_hello
+        self.assertIsNone(parse_tls_client_hello(b"GET / HTTP/1.1\r\n\r\n"))
+
+    def test_channel_observed_never_dropped(self):
+        e = VerdictEngine([TlsObserveDetector(mode="observe")])
+        verdict, info = e.verdict(build_packet(8443, _tls_client_hello("svc")))
+        self.assertEqual(verdict, VERDICT_ACCEPT)
+        self.assertTrue(any("tls_channel" in r for r in info["reasons"]))
+        evidence = next(i for i in info["evidence"] if i["rule_id"] == "TLS-CHANNEL-OBS")
+        self.assertFalse(evidence["drop_eligible"])
+
+    def test_reported_once_per_flow(self):
+        e = VerdictEngine([TlsObserveDetector(mode="observe")])
+        ch = _tls_client_hello("svc")
+        e.verdict(build_packet(8443, ch))
+        _, info = e.verdict(build_packet(8443, ch))
+        self.assertEqual(info["reasons"], [])
+
 
 class TestQAGates(unittest.TestCase):
     """AI 생성 코드 핵심 주장인 결정적 verdict와 AI 경로 격리의 회귀 검증"""
@@ -1022,15 +1394,17 @@ class TestQAGates(unittest.TestCase):
         self.assertEqual(len(assigned), len(set(assigned)))
 
     def test_phase3_operational_rules_block_product_union_sqli(self):
-        import signatures
-        e = VerdictEngine.from_config(signatures.SIGNATURES, signatures.WHITELIST)
+        # 룰 담당자가 레거시 L3-SQL 시그니처를 제거(Signatures repo, "mavlink rules enhanced").
+        # SQLi 차단 능력은 구조형 L3ProductIdDetector가 유지하므로, 배포 엔진 전체로 검증한다.
+        e = load_engine()
         packet = packet_for(
             8084,
             "/product?id=-1%20UNION%20SELECT%201,(SELECT%20v%20FROM%20app_meta%20WHERE%20k='deploy_token'),3--",
         )
         verdict, info = e.verdict(packet)
         self.assertEqual(verdict, VERDICT_DROP)
-        self.assertIn("L3-SQL-001", [item["rule_id"] for item in info["evidence"]])
+        self.assertIn("L3-PRODUCT-ID-STRUCTURE",
+                      [item["rule_id"] for item in info["evidence"]])
 
     def test_phase3_operational_rules_accept_numeric_product_id(self):
         import signatures
@@ -1039,12 +1413,13 @@ class TestQAGates(unittest.TestCase):
         self.assertEqual(verdict, VERDICT_ACCEPT)
 
     def test_phase3_operational_rules_block_encoded_comment_evasion(self):
-        import signatures
-        e = VerdictEngine.from_config(signatures.SIGNATURES, signatures.WHITELIST)
+        # 인라인 주석 회피(UnIoN/**/SeLeCt)도 구조형 L3ProductIdDetector가 배포 엔진에서 차단.
+        e = load_engine()
         verdict, info = e.verdict(packet_for(
             8084, "/product?id=-1%20UnIoN/**/SeLeCt%201,2,3--"))
         self.assertEqual(verdict, VERDICT_DROP)
-        self.assertIn("L3-SQL-001", [item["rule_id"] for item in info["evidence"]])
+        self.assertIn("L3-PRODUCT-ID-STRUCTURE",
+                      [item["rule_id"] for item in info["evidence"]])
 
     def test_phase3_structural_guard_decodes_plus_as_space(self):
         e = VerdictEngine([L3ProductIdDetector(mode="enforce")])
@@ -1200,6 +1575,70 @@ class TestPcap(unittest.TestCase):
             out = list(read_pcap(compressed))
             self.assertEqual(len(out), 1)
             self.assertAlmostEqual(out[0][0], 1000.0, places=4)
+
+
+class TestRoundReportBypassSample(unittest.TestCase):
+    """round_report의 우회 샘플 표현이 텍스트/바이너리를 구분하는지 검증.
+
+    본선 방산 프로토콜은 바이너리라, 기존의 첫 줄 latin-1 디코드는 깨진 문자만
+    남겼다. 프로토콜 지문 + hex dump로 의미 있는 샘플을 남기는지 확인한다."""
+
+    def test_http_text_shows_request_line(self):
+        from tools.round_report import bypass_sample
+        raw = b"GET /fetch?url=http://helper HTTP/1.1\r\nHost: t\r\n\r\n"
+        self.assertEqual(bypass_sample(raw), "GET /fetch?url=http://helper HTTP/1.1")
+
+    def test_binary_protocols_fingerprinted(self):
+        from tools.round_report import _fingerprint
+        # MBAP: tid(2) proto=0(2) length(2)=len(pdu)+1 unit(1) + FC03 read
+        modbus = struct.pack(">HHHB", 1, 0, 6, 1) + b"\x03\x00\x00\x00\x0a"
+        self.assertEqual(_fingerprint(modbus), "Modbus/TCP")
+        self.assertEqual(_fingerprint(b"\xfd\x14\x00\x00\x00" + b"\x00" * 30), "MAVLink v2")
+        self.assertEqual(_fingerprint(b"RTPS\x02\x03\x01\x0f" + b"\x00" * 16), "RTPS")
+
+    def test_binary_sample_is_hex_not_garbage(self):
+        from tools.round_report import bypass_sample
+        modbus = struct.pack(">HHHB", 1, 0, 6, 1) + b"\x03\x00\x00\x00\x0a"
+        sample = bypass_sample(modbus)
+        self.assertIn("[Modbus/TCP]", sample)
+        self.assertIn("03 00 00 00 0a", sample)   # hex dump 형태
+
+
+class TestSuricataScan(unittest.TestCase):
+    """오프라인 Suricata 분석 도구의 eve.json 집계 로직. Suricata 없이도 검증."""
+
+    @staticmethod
+    def _alert(sid, dport, detector, layer="L2_MCS", attack="x"):
+        return {"event_type": "alert", "dest_port": dport,
+                "alert": {"signature_id": sid, "signature": f"sig-{sid}",
+                          "metadata": {"detector": [detector], "layer": [layer],
+                                       "attack": [attack]}}}
+
+    def test_non_alert_events_ignored(self):
+        from tools.suricata_scan import summarize_eve
+        s = summarize_eve([{"event_type": "flow"}, {"event_type": "stats"}])
+        self.assertEqual(s["total_alerts"], 0)
+        self.assertEqual(s["signatures"], [])
+
+    def test_sid_maps_to_protocol_and_port_env(self):
+        from tools.suricata_scan import summarize_eve
+        events = ([self._alert(9000102, 502, "MODBUS-READ-SCAN")] * 20
+                  + [self._alert(9000201, 14550, "MAV-READ-SCAN", "L3_UAV")] * 5
+                  + [self._alert(9000401, 7400, "RTPS-READ-SCAN", "L4_UGV")] * 3)
+        s = summarize_eve(events)
+        self.assertEqual(s["total_alerts"], 28)
+        settings = {x["setting"] for x in s["suggestions"]}
+        self.assertIn("DEF_MODBUS_PORTS=502", settings)
+        self.assertIn("DEF_MAVLINK_PORTS=14550", settings)
+        self.assertIn("DEF_RTPS_PORTS=7400", settings)
+
+    def test_signatures_sorted_by_hits(self):
+        from tools.suricata_scan import summarize_eve
+        events = [self._alert(9000201, 14550, "MAV-READ-SCAN")] + \
+                 [self._alert(9000102, 502, "MODBUS-READ-SCAN")] * 3
+        s = summarize_eve(events)
+        self.assertEqual(s["signatures"][0]["protocol"], "Modbus")   # 3건 > 1건
+        self.assertEqual(s["signatures"][0]["hits"], 3)
 
 
 class TestBrokerContract(unittest.TestCase):

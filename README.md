@@ -261,10 +261,14 @@ DEF_MODBUS_MODE=observe
 DEF_MODBUS_PORTS=502
 ```
 
-- **MAVLink** version, system/component ID, message ID, sequence, signed timestamp와 설정된 `PARAM_SET` 안전 범위 관찰. `COMMAND_LONG`과 `MISSION_ITEM` 핵심 필드 추출 포함. CRC-extra는 message 종류별 checksum 계산에 추가되는 값
-- **CCSDS** primary header, APID, sequence, packet length, 선택적 FECF와 설정된 민감 TC 명령 관찰. 예선 SDLS 프로파일 사용 시 counter replay 및 선택적 HMAC-SHA256 검증 포함. FECF는 전송 오류를 검출하는 frame checksum이며 송신자 인증 기능은 아님
-- **RTPS / DDS** protocol profile, vendor, participant GUID와 submessage boundary 관찰. participant GUID는 DDS 참여자의 식별자이고 submessage boundary는 한 메시지 안의 세부 단위 경계
-- **Modbus/TCP** MBAP(Modbus Application Protocol) header 유효성과 함수 코드 관찰. `TransactionId(2)|ProtocolId(2,=0)|Length(2)|UnitId(1)` 구성의 ProtocolId가 0이 아니면 Modbus로 판단하지 않는다. 선언된 Length와 실제 payload 길이가 정확히 일치할 때만 well-formed 프레임으로 취급한다 — Modbus/TCP는 응답을 기다리지 않고 다음 요청을 연속 전송(pipelining)할 수 있어, 불일치를 곧장 위반으로 판정하면 정상 트래픽을 오탐할 수 있다. 읽기 함수 코드(01/02/03/04/07/0B/0C/11/2B)는 무시하고, 그 외 함수 코드(쓰기·진단)만 관찰 대상으로 기록한다. 정상 제어 트래픽에 쓰기가 포함되는지 확인된 baseline이 없어 `enforce`에서도 차단하지 않는다 — port profile만 요구하는 CCSDS와 달리 이 항목은 baseline 확인 전까지 항상 관찰 전용이다.
+- **MAVLink** version, system/component ID, message ID, sequence, signed timestamp와 설정된 `PARAM_SET` 안전 범위 관찰. `COMMAND_LONG`과 `MISSION_ITEM` 핵심 필드 추출 포함. `PARAM_REQUEST_READ`(msgid 20) 열거 관찰(`MAV-READ-SCAN`) — 짧은 창에서 서로 다른 param 대상을 임계 초과로 조회하면 telemetry-read 탈취 스캔으로 관찰만 기록(차단 없음). **message-ID 프로파일 관찰**(2026-08-20, ocslab MAVLink message-ID sequence 데이터셋 반영) — warmup 동안 flow별 msgid 집합을 자가학습하고 이후 프로파일 밖 msgid 등장(`MAV-MSGID-PROFILE`)·특정 msgid flooding(`MAV-MSGID-RATE`, 룰셋 UAV-MAV-021 방향)을 관찰만 기록. False Injection의 "예상 밖 메시지/증폭" 신호이며 GAN 기반 시퀀스 모델을 baseline 없이 쓸 수 있는 집합+rate 근사로 구현. CRC-extra는 message 종류별 checksum 계산에 추가되는 값
+- **CCSDS** primary header, APID, sequence, packet length, 선택적 FECF와 설정된 민감 TC 명령 관찰. 예선 SDLS 프로파일 사용 시 counter replay 및 선택적 HMAC-SHA256 검증 포함. FECF는 전송 오류를 검출하는 frame checksum이며 송신자 인증 기능은 아님. APID 열거 관찰(`CCSDS-READ-SCAN`) — 서비스 단위 distinct APID가 임계 초과면 flag telemetry를 찾는 `ccsds-tm-read` 스캔으로 관찰만 기록(차단 없음)
+- **RTPS / DDS** protocol profile, vendor, participant GUID와 submessage boundary 관찰. participant GUID는 DDS 참여자의 식별자이고 submessage boundary는 한 메시지 안의 세부 단위 경계. DATA/DATA_FRAG 서브메시지에서 reader/writer 엔티티 ID를 추출해 topic 열거 관찰(`RTPS-READ-SCAN`) — 서비스 단위 distinct writerId(topic)가 임계 초과면 `ros2-topic-read` 스캔으로 관찰만 기록. SPDP discovery(소수 builtin writer 반복)는 무신호
+- **Modbus/TCP** MBAP(Modbus Application Protocol) header 유효성과 함수 코드 관찰. `TransactionId(2)|ProtocolId(2,=0)|Length(2)|UnitId(1)` 구성의 ProtocolId가 0이 아니면 Modbus로 판단하지 않는다. 선언된 Length와 실제 payload 길이가 정확히 일치할 때만 well-formed 프레임으로 취급한다 — Modbus/TCP는 응답을 기다리지 않고 다음 요청을 연속 전송(pipelining)할 수 있어, 불일치를 곧장 위반으로 판정하면 정상 트래픽을 오탐할 수 있다. 읽기 함수 코드(01/02/03/04/07/0B/0C/11/2B) 자체는 위반이 아니지만, 재조립 버퍼의 연속 MBAP 프레임을 훑어 read 대상(fc, 시작주소)을 서비스(dst,dport) 단위로 집계하고 짧은 창에서 distinct 대상이 임계 초과면 주소 공간 스캔으로 관찰만 기록한다(`MODBUS-READ-SCAN`). attack-agent가 P1로 지정한 `modbus-read-regs` 탈취 대응이며, NAT/재접속을 고려해 연결이 아닌 서비스 단위로 묶어 한 연결 파이프라인·재접속·간격 스캔을 모두 포착한다. 정상 반복 폴링(같은 레지스터)은 distinct=1이라 신호가 없다. 쓰기·진단 함수 코드는 정상 제어 트래픽에 포함되는지 확인된 baseline이 없어 `enforce`에서도 차단하지 않는다 — port profile만 요구하는 CCSDS와 달리 이 항목은 baseline 확인 전까지 항상 관찰 전용이다. read 열거 관찰도 `OBSERVATION_ONLY`(weight 0)라 어떤 모드에서도 차단하지 않고 enforce 전환 판단 자료로만 쓴다.
+- **UDS-over-CAN-over-TCP** (2026-08-20 추가, attack-agent origin/main P1 `can_uds_read`) 게이트웨이 프레임(`arb_id(4)|len(1)|UDS PDU`)을 walk하고, 읽기 SID(0x22 RDBI 등)의 DID를 서비스 단위로 집계해 DID 스캔을 관찰만 기록한다(`UDS-READ-SCAN`). 비-read SID(쓰기·루틴)는 관찰만(`UDS-WRITE-SID`). CAN에는 magic이 없어 port profile 필요.
+- **IEC 60870-5-104** (attack-agent P2 `iec104_read`) APCI I-format(`0x68|len|ctrl(4)|ASDU`)을 walk하고, 읽기/심문 type(C_RD_NA_1=102, C_IC_NA_1=100)의 IOA를 집계해 IOA 스캔을 관찰만 기록한다(`IEC104-READ-SCAN`). 제어 명령 type(45~69)은 관찰만(`IEC104-CTRL`). port profile 필요.
+- **SNMP v1/v2c** (attack-agent P2 `snmp_v2c_get`) BER(`SEQUENCE{version, community, PDU}`)를 파싱해, GetRequest/GetNext/GetBulk의 OID를 집계해 OID 스캔을 관찰만 기록한다(`SNMP-READ-SCAN`). SetRequest(0xA3)는 관찰만(`SNMP-SET`). port profile 필요(보통 161).
+- **TLS 채널 관찰기** (`TlsObserveDetector`) ClientHello를 파싱해 버전·SNI·포트를 관찰하고, 해당 포트가 암호화 채널이라 payload 기반 방산 detector가 blind임을 알린다(`TLS-CHANNEL-OBS`). 복호화는 하지 않으며 항상 관찰 전용(차단 없음)·flow당 1회·포트 무관. attack-agent harness가 raw-TLS/https probe(`import ssl`)를 쓰는 데 대한 **상황 인지용** — TLS-wrapped 방산 프로토콜은 구조적으로 payload 탐지가 불가능하므로 대응은 운영 레벨(상류 TLS termination 등) 또는 blind 수용이다.
 
 현재 MAVLink parser는 프로파일에 등록된 message ID의 CRC-X25와 CRC_EXTRA를 검증한다. 등록되지 않은 message와 본선에서 추가되는 dialect 고유 message는 CRC_EXTRA를 알 수 없으므로 의미 기반 차단 대상으로 사용하지 않는다. CCSDS FECF 역시 무결성 오류를 찾을 뿐 패킷 송신자를 인증하지 않는다.
 
@@ -342,6 +346,13 @@ docker compose logs -f team1-defender | grep DEFENDER_EVENT
 | `DEF_RTPS_PORTS` | 빈 값 | 쉼표로 구분한 RTPS 목적지 포트 profile |
 | `DEF_MODBUS_MODE` | `observe` | Modbus detector의 `off`, `observe`, `enforce` 모드 |
 | `DEF_MODBUS_PORTS` | 빈 값 | 쉼표로 구분한 Modbus 목적지 포트 profile |
+| `DEF_UDS_CAN_MODE` | `observe` | UDS-over-CAN-over-TCP detector 모드 |
+| `DEF_UDS_CAN_PORTS` | 빈 값 | 쉼표로 구분한 UDS/CAN 게이트웨이 포트 profile |
+| `DEF_IEC104_MODE` | `observe` | IEC 60870-5-104 detector 모드 |
+| `DEF_IEC104_PORTS` | 빈 값 | 쉼표로 구분한 IEC-104 포트 profile(보통 2404) |
+| `DEF_SNMP_MODE` | `observe` | SNMP detector 모드 |
+| `DEF_SNMP_PORTS` | 빈 값 | 쉼표로 구분한 SNMP 포트 profile(보통 161) |
+| `DEF_TLS_MODE` | `observe` | TLS 채널 관찰기 모드(암호화 채널·SNI 관찰, 차단 안 함, 포트 무관) |
 | `DEF_BG_ANALYSIS` | `0` | 백그라운드 LLM 분석 활성화 여부 |
 | `LLM_BASE_URL` | `http://litellm.lig.internal:4000` | OpenAI-compatible gateway 주소 |
 | `LLM_API_KEY` | 빈 값 | gateway 인증 key. 코드나 Git에 저장하지 않음 |

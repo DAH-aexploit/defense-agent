@@ -132,6 +132,65 @@ def analyze_log(path: Path | None) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────
+#  우회 샘플 표현 — 텍스트/바이너리 자동 판별
+# ──────────────────────────────────────────────────────────────────────
+def _printable_ratio(data: bytes) -> float:
+    """출력 가능 문자 비율. HTTP 등 텍스트 프로토콜 판별용."""
+    if not data:
+        return 1.0
+    ok = sum(1 for b in data if b in (0x09, 0x0A, 0x0D) or 0x20 <= b < 0x7F)
+    return ok / len(data)
+
+
+# 방산 바이너리 프로토콜 지문 — attack-agent의 판별 방식과 동일한 근거(구조 자체)
+#   RTPS: 매직 "RTPS"  ·  MAVLink v2/v1: 0xFD/0xFE 시작
+#   Modbus/TCP: MBAP ProtocolId==0 이면서 Length가 나머지 바이트와 일치
+#   CCSDS SPP: version 000 이면서 packet length 필드가 전체 길이와 일치
+_PROTO_HINTS = (
+    ("RTPS", lambda d: d[:4] == b"RTPS"),
+    ("MAVLink v2", lambda d: d[:1] == b"\xfd"),
+    ("MAVLink v1", lambda d: d[:1] == b"\xfe"),
+    ("Modbus/TCP", lambda d: len(d) >= 8 and d[2:4] == b"\x00\x00"
+        and int.from_bytes(d[4:6], "big") == len(d) - 6),
+    ("CCSDS SPP", lambda d: len(d) >= 7 and (d[0] >> 5) == 0
+        and int.from_bytes(d[4:6], "big") == len(d) - 7),
+)
+
+
+def _fingerprint(data: bytes) -> str | None:
+    """재조립된 페이로드의 프로토콜 지문을 구조 근거로 추정. 미상이면 None."""
+    for name, test in _PROTO_HINTS:
+        try:
+            if test(data):
+                return name
+        except (IndexError, ValueError):
+            continue
+    return None
+
+
+def _hexdump(data: bytes, limit: int = 48) -> str:
+    chunk = data[:limit]
+    hexpart = chunk.hex(" ")
+    ascii_part = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
+    tail = " …" if len(data) > limit else ""
+    return f"{hexpart}  |{ascii_part}|{tail}"
+
+
+def bypass_sample(data: bytes) -> str:
+    """우회 요청 샘플을 텍스트/바이너리에 맞춰 표현한다.
+
+    HTTP 등 텍스트 프로토콜은 요청 첫 줄을, 방산 바이너리 프로토콜(MAVLink/CCSDS/
+    Modbus/RTPS)은 프로토콜 지문 + hex dump를 반환한다. 첫 줄을 그대로 latin-1로
+    디코드하던 기존 방식은 바이너리에서 깨진 문자만 남아 본선 트래픽 분석에 쓸 수 없었다.
+    """
+    if _printable_ratio(data[:180]) >= 0.85:
+        return data.split(b"\r\n", 1)[0][:180].decode("latin-1", "ignore")
+    proto = _fingerprint(data)
+    label = f"[{proto}] " if proto else "[binary] "
+    return label + _hexdump(data)
+
+
+# ──────────────────────────────────────────────────────────────────────
 #  PCAP
 # ──────────────────────────────────────────────────────────────────────
 def infer_service_port(events: list) -> int | None:
@@ -170,6 +229,7 @@ def analyze_layer(paths: list[Path], engine_factory) -> dict:
     successes = []
     inbound = dropped = 0
     rules: collections.Counter = collections.Counter()
+    observations: collections.Counter = collections.Counter()
 
     for ts, ip in events:
         parsed = VerdictEngine.parse_l4(ip)
@@ -183,9 +243,17 @@ def analyze_layer(paths: list[Path], engine_factory) -> dict:
             inbound += 1
             if verdict == VERDICT_DROP:
                 dropped += 1
-                for item in info.get("evidence", []):
-                    if item.get("drop_eligible") and item.get("rule_id"):
-                        rules[item["rule_id"]] += 1
+            for item in info.get("evidence", []):
+                rid = item.get("rule_id")
+                if not rid:
+                    continue
+                # DROP 근거는 차단 실적으로, 관찰 전용 근거(enumeration·write 등)는
+                # 별도 신호로 집계한다. observe 모드에서도 공격 탐침이 어떤 flow에서
+                # 일어나는지 운영자가 보고 enforce 전환 판단에 쓸 수 있게 한다.
+                if item.get("drop_eligible"):
+                    rules[rid] += 1
+                else:
+                    observations[rid] += 1
             if payload:
                 conns[(src, sport)].append((ts, seq, payload, verdict))
         elif sport == port and payload and FLAG_RE.search(payload):
@@ -208,8 +276,7 @@ def analyze_layer(paths: list[Path], engine_factory) -> dict:
         by_seq = b"".join(s[2] for s in sorted(segs, key=lambda s: s[1]))
         if arrival != by_seq:
             reordered += 1
-        line = by_seq.split(b"\r\n")[0][:180].decode("latin-1", "ignore")
-        samples[f"{line}  [세그먼트 {len(segs)}]"] += 1
+        samples[f"{bypass_sample(by_seq)}  [세그먼트 {len(segs)}]"] += 1
 
     return {
         "available": True,
@@ -218,6 +285,7 @@ def analyze_layer(paths: list[Path], engine_factory) -> dict:
         "inbound_packets": inbound,
         "replay_drops": dropped,
         "replay_rules": dict(rules.most_common()),
+        "observations": dict(observations.most_common()),
         "flag_responses": len(successes),
         "blocked_connections": blocked,
         "bypassed_connections": bypassed,
@@ -284,6 +352,19 @@ def render(round_key: str, log: dict, layers: dict) -> str:
         out += ["```text"]
         out += [f"{n}회  {line}" for line, n in d["bypass_samples"]]
         out += ["```", ""]
+
+    obs_layers = [n for n in sorted(layers)
+                  if layers[n].get("available") and layers[n].get("observations")]
+    if obs_layers:
+        out += ["## 2-1. 관찰 신호 (차단 안 함 · enforce 전환 판단용)", "",
+                "> observe 모드의 관찰 전용 근거다. 점수·차단에 영향은 없지만, 어떤 flow가",
+                "> read 열거·쓰기 등으로 탐침 중인지 보여준다. 정상 baseline과 대조해 enforce",
+                "> 전환 여부를 판단한다. 단일 조회는 신호를 남기지 않는다(임계 초과 시에만).", "",
+                "| 레이어 | 관찰 룰 ID | 관측 |", "|---|---|---:|"]
+        for name in obs_layers:
+            for rid, n in layers[name]["observations"].items():
+                out.append(f"| {name} | `{rid}` | {n:,} |")
+        out.append("")
 
     out += ["## 3. 판단 기준", "",
             "- `rule coverage` 부재와 낮은 적재 룰 수는 구버전 이미지 실행을 의미한다",

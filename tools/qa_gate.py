@@ -58,6 +58,7 @@ def main() -> int:
                         "tests/packet_util.py", "tests/rule_fixtures.py",
                         "tools/pcap_analyze.py", "tools/round_report.py",
                         "tools/round_watch.py", "tools/image_verify.py",
+                        "tools/suricata_scan.py", "tools/bansan_sim.py",
                         "tools/dependency_audit.py"]),
         run("dependency and license policy", [sys.executable, "tools/dependency_audit.py"]),
         run("unit and safety tests", [sys.executable, "-m", "unittest", "discover",

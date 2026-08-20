@@ -1,0 +1,162 @@
+# DAH 2026 방어 에이전트 — 방산 프로토콜 오프라인 분석 룰셋
+#
+# 운영자 로컬 전용. 대회 배포 이미지에는 넣지 않는다.
+#   Suricata는 GPLv2 → 대회규정 제14조(permissive 라이선스만 허용, GPL/LGPL EXCLUDE)상
+#   배포 이미지에 번들하면 규정 위반 소지. 그래서 라운드 PCAP를 로컬에서 분석하는 용도로만
+#   쓴다(이미지에 미배포 → 라이선스 문제 없음). attack-agent가 pymavlink/scapy를 배제한 것과
+#   같은 이유다.
+#
+# 목적: 라운드 PCAP에서 방산 프로토콜과 실제 포트를 독립적으로 식별하고, 우리 엔진의
+#   detector(MODBUS-READ-SCAN / MAV-READ-SCAN / CCSDS-READ-SCAN / RTPS-READ-SCAN 등)와
+#   교차 확인한다. Suricata가 어떤 포트에서 무슨 프로토콜을 봤는지 알려주면, 그 포트를
+#   DEF_*_PORTS에 넣고 enforce 전환 여부를 판단한다.
+#
+# 모든 룰은 alert(차단 아님) — 오프라인 분석이라 트래픽에 개입하지 않는다.
+# metadata의 detector 필드는 대응하는 우리 엔진 detector를 가리킨다.
+#
+# sid 대역: 9000000~ (로컬 커스텀 전용, 공개 룰셋과 충돌 회피)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Modbus/TCP — attack-agent P1: modbus-read-regs (FC03/04 register read)
+#   MBAP: TransactionId(2) | ProtocolId(2,=0) | Length(2) | UnitId(1) | FC(1) ...
+#   ProtocolId==0(offset 2, 2byte)이면서 FC(offset 7)가 읽기 함수 코드
+# ─────────────────────────────────────────────────────────────────────────────
+alert tcp any any -> any any (msg:"DAH Modbus read function code (FC01-04)"; \
+    flow:to_server,established; content:"|00 00|"; offset:2; depth:2; \
+    byte_test:1,>=,1,7; byte_test:1,<=,4,7; \
+    metadata:detector MODBUS-READ-SCAN, layer L2_MCS L4_UGV, attack modbus-read-regs; \
+    classtype:protocol-command-decode; sid:9000101; rev:1;)
+
+# Modbus read 열거(스캔): 한 목적지로 짧은 창에 read가 다수 → 주소 공간 sweep 의심.
+#   우리 ModbusDetector의 서비스 단위 distinct 집계와 같은 신호를 Suricata로 교차 확인.
+alert tcp any any -> any any (msg:"DAH Modbus read enumeration (address sweep)"; \
+    flow:to_server,established; content:"|00 00|"; offset:2; depth:2; \
+    byte_test:1,>=,1,7; byte_test:1,<=,4,7; \
+    detection_filter:track by_dst, count 16, seconds 5; \
+    metadata:detector MODBUS-READ-SCAN, layer L2_MCS L4_UGV, attack modbus-read-regs; \
+    classtype:attempted-recon; sid:9000102; rev:1;)
+
+# Modbus 쓰기/진단 함수 코드(05/06/0F/10/16/17/08) — 관찰만(우리 엔진도 baseline 전까지 관찰).
+alert tcp any any -> any any (msg:"DAH Modbus write/diagnostic function code"; \
+    flow:to_server,established; content:"|00 00|"; offset:2; depth:2; \
+    byte_test:1,>=,5,7; \
+    metadata:detector MODBUS-WRITE-FC, layer L2_MCS L4_UGV; \
+    classtype:protocol-command-decode; sid:9000103; rev:1;)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAVLink v1/v2 — attack-agent: mavlink-telemetry-read (PARAM_REQUEST_READ 등)
+#   v2 magic 0xFD / v1 magic 0xFE (datagram/스트림 시작)
+# ─────────────────────────────────────────────────────────────────────────────
+alert udp any any -> any any (msg:"DAH MAVLink v2 frame"; \
+    content:"|fd|"; depth:1; \
+    metadata:detector MAV-READ-SCAN, layer L3_UAV, attack mavlink-telemetry-read; \
+    classtype:protocol-command-decode; sid:9000201; rev:1;)
+
+alert udp any any -> any any (msg:"DAH MAVLink v1 frame"; \
+    content:"|fe|"; depth:1; \
+    metadata:detector MAV-READ-SCAN, layer L3_UAV, attack mavlink-telemetry-read; \
+    classtype:protocol-command-decode; sid:9000202; rev:1;)
+
+# MAVLink PARAM_REQUEST_READ(msgid 20) 반복 → param 공간 열거 의심.
+#   v2: byte0=0xFD, msgid는 little-endian 3byte(offset 7). msgid==20 이면 payload_len(offset1)=20.
+alert udp any any -> any any (msg:"DAH MAVLink PARAM_REQUEST_READ enumeration"; \
+    content:"|fd|"; depth:1; byte_test:3,=,20,7,little; \
+    detection_filter:track by_dst, count 12, seconds 10; \
+    metadata:detector MAV-READ-SCAN, layer L3_UAV, attack mavlink-telemetry-read; \
+    classtype:attempted-recon; sid:9000203; rev:1;)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CCSDS Space Packet — attack-agent: ccsds-tm-read
+#   Primary header byte0 상위 3bit(version)==000. TM(type=0)/TC(type=1)은 byte0 bit4.
+# ─────────────────────────────────────────────────────────────────────────────
+alert udp any any -> any any (msg:"DAH CCSDS Space Packet (version 000)"; \
+    byte_test:1,=,0,0,&,0xE0; \
+    metadata:detector CCSDS-READ-SCAN, layer L1_SAT, attack ccsds-tm-read; \
+    classtype:protocol-command-decode; sid:9000301; rev:1;)
+
+# CCSDS APID 열거: 짧은 창에 CCSDS 패킷이 다수 → APID sweep 의심(우리 CCSDS-READ-SCAN와 교차).
+alert udp any any -> any any (msg:"DAH CCSDS APID enumeration (telemetry sweep)"; \
+    byte_test:1,=,0,0,&,0xE0; \
+    detection_filter:track by_dst, count 8, seconds 10; \
+    metadata:detector CCSDS-READ-SCAN, layer L1_SAT, attack ccsds-tm-read; \
+    classtype:attempted-recon; sid:9000302; rev:1;)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RTPS/DDS — attack-agent: dds-discovery, ros2-topic-read
+#   magic "RTPS"(offset 0, 4byte). DATA 서브메시지(0x15)는 topic read 신호.
+# ─────────────────────────────────────────────────────────────────────────────
+alert udp any any -> any any (msg:"DAH RTPS/DDS message"; \
+    content:"RTPS"; depth:4; \
+    metadata:detector RTPS-READ-SCAN, layer L4_UGV, attack dds-discovery; \
+    classtype:protocol-command-decode; sid:9000401; rev:1;)
+
+# RTPS topic 열거: RTPS 메시지가 짧은 창에 다수 → topic/reader sweep 의심.
+alert udp any any -> any any (msg:"DAH RTPS topic enumeration (read sweep)"; \
+    content:"RTPS"; depth:4; \
+    detection_filter:track by_dst, count 16, seconds 10; \
+    metadata:detector RTPS-READ-SCAN, layer L4_UGV, attack ros2-topic-read; \
+    classtype:attempted-recon; sid:9000402; rev:1;)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UDS-over-CAN-over-TCP — attack-agent origin/main P1: can_uds_read (ReadDataByIdentifier)
+#   게이트웨이 frame: arbitration_id(4,BE) | len(1) | UDS PDU. 진단 arb id 0x7DF(req)/0x7E8(resp).
+#   ReadDataByIdentifier SID 0x22가 offset 5(arb 4 + len 1 다음).
+# ─────────────────────────────────────────────────────────────────────────────
+alert tcp any any -> any any (msg:"DAH UDS ReadDataByIdentifier (diag request)"; \
+    flow:to_server,established; content:"|00 00 07 df|"; depth:4; content:"|22|"; offset:5; depth:1; \
+    metadata:detector UDS-READ-SCAN, layer L4_UGV, attack can-uds-read; \
+    classtype:protocol-command-decode; sid:9000501; rev:1;)
+
+alert tcp any any -> any any (msg:"DAH UDS DID enumeration (read sweep)"; \
+    flow:to_server,established; content:"|00 00 07 df|"; depth:4; content:"|22|"; offset:5; depth:1; \
+    detection_filter:track by_dst, count 16, seconds 5; \
+    metadata:detector UDS-READ-SCAN, layer L4_UGV, attack can-uds-read; \
+    classtype:attempted-recon; sid:9000502; rev:1;)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IEC 60870-5-104 — attack-agent origin/main P2: iec104_read
+#   APCI I-format: 0x68 | len | ctrl(4) | ASDU. ASDU type_id가 offset 6.
+#   C_RD_NA_1=102(0x66), C_IC_NA_1=100(0x64) = 읽기/심문.
+# ─────────────────────────────────────────────────────────────────────────────
+alert tcp any any -> any any (msg:"DAH IEC-104 read/interrogation (C_RD/C_IC)"; \
+    flow:to_server,established; content:"|68|"; depth:1; byte_test:1,&,0x01,2,!; \
+    content:"|66|"; offset:6; depth:1; \
+    metadata:detector IEC104-READ-SCAN, layer L2_MCS, attack iec104-read; \
+    classtype:protocol-command-decode; sid:9000601; rev:1;)
+
+alert tcp any any -> any any (msg:"DAH IEC-104 IOA enumeration (read sweep)"; \
+    flow:to_server,established; content:"|68|"; depth:1; content:"|66|"; offset:6; depth:1; \
+    detection_filter:track by_dst, count 16, seconds 5; \
+    metadata:detector IEC104-READ-SCAN, layer L2_MCS, attack iec104-read; \
+    classtype:attempted-recon; sid:9000602; rev:1;)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SNMP v1/v2c — attack-agent origin/main P2: snmp_v2c_get (GetRequest OID read)
+#   BER SEQUENCE(0x30) { version, community, GetRequest[0xA0] }. GetRequest tag 0xA0.
+# ─────────────────────────────────────────────────────────────────────────────
+alert udp any any -> any any (msg:"DAH SNMP GetRequest (M&C read)"; \
+    content:"|30|"; depth:1; content:"|a0|"; \
+    metadata:detector SNMP-READ-SCAN, layer L1_SAT, attack snmp-get; \
+    classtype:protocol-command-decode; sid:9000701; rev:1;)
+
+alert udp any any -> any any (msg:"DAH SNMP OID enumeration (GetRequest sweep)"; \
+    content:"|30|"; depth:1; content:"|a0|"; \
+    detection_filter:track by_dst, count 16, seconds 10; \
+    metadata:detector SNMP-READ-SCAN, layer L1_SAT, attack snmp-get; \
+    classtype:attempted-recon; sid:9000702; rev:1;)
+
+# SNMP SetRequest(0xA3) — 쓰기. attack-agent는 read만 실행하나, 관측되면 표시.
+alert udp any any -> any any (msg:"DAH SNMP SetRequest (write)"; \
+    content:"|30|"; depth:1; content:"|a3|"; \
+    metadata:detector SNMP-SET, layer L1_SAT; \
+    classtype:protocol-command-decode; sid:9000703; rev:1;)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TLS 채널 — attack-agent origin/main harness가 raw-TLS/https probe 사용(import ssl).
+#   방산 프로토콜이 TLS로 감싸지면 우리 payload 파서는 blind. 어떤 포트가 암호화인지
+#   식별해 "여기는 protocol detector가 무력화됨"을 알린다. tls.sni로 대상 서비스 파악.
+# ─────────────────────────────────────────────────────────────────────────────
+alert tcp any any -> any any (msg:"DAH TLS ClientHello (encrypted channel, payload detector blind)"; \
+    flow:to_server,established; content:"|16 03|"; depth:2; content:"|01|"; distance:3; within:1; \
+    metadata:detector TLS-CHANNEL-OBS, layer COMMON, attack raw-tls; \
+    classtype:protocol-command-decode; sid:9000801; rev:1;)

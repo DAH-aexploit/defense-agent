@@ -484,6 +484,9 @@ class MavlinkDetector(Detector):
                  state_ttl: float = 120.0, max_keys: int = 4096,
                  id_window: float = 10.0, max_ids: int = 32,
                  repeat_window: float = 2.0, repeat_limit: int = 4,
+                 param_read_window: float = 10.0, param_read_scan: int = 12,
+                 msgid_warmup: int = 40, msgid_rate_window: float = 2.0,
+                 msgid_rate_limit: int = 60,
                  validate_crc: bool = False,
                  param_ranges: dict | None = None,
                  dangerous_commands=None, now=None) -> None:
@@ -494,6 +497,16 @@ class MavlinkDetector(Detector):
         self.state_ttl, self.max_keys = float(state_ttl), max(32, int(max_keys))
         self.id_window, self.max_ids = float(id_window), int(max_ids)
         self.repeat_window, self.repeat_limit = float(repeat_window), int(repeat_limit)
+        self.param_read_window = float(param_read_window)
+        self.param_read_scan = max(1, int(param_read_scan))
+        # message-ID 프로파일 관찰: HITL MAVLink 데이터셋(ocslab GUIDE, message-ID sequence로
+        # False Injection 탐지) 근거. 정상 미션은 안정된 msgid 집합·cadence를 갖고, 인젝션은
+        # 예상 밖 msgid나 특정 msgid flooding으로 이를 교란한다. warmup 동안 flow별 msgid 집합을
+        # 자가학습하고, 이후 신규 msgid/과도한 msgid rate를 관찰만 남긴다(baseline 없이 차단 금지).
+        # 룰 담당자 신규 룰 UAV-MAV-021(msgid별 요청률)과도 같은 방향의 관찰 신호.
+        self.msgid_warmup = max(1, int(msgid_warmup))
+        self.msgid_rate_window = float(msgid_rate_window)
+        self.msgid_rate_limit = max(1, int(msgid_rate_limit))
         self.validate_crc = bool(validate_crc)
         self.param_ranges = {
             str(name): (float(spec[0]), float(spec[1]))
@@ -507,6 +520,10 @@ class MavlinkDetector(Detector):
         self._max_ts = BoundedState(self.max_keys, self.state_ttl, self._now)
         self._ids = BoundedState(self.max_keys, self.state_ttl, self._now)
         self._repeat = BoundedState(self.max_keys, self.state_ttl, self._now)
+        self._param_reads = BoundedState(self.max_keys, self.state_ttl, self._now)
+        self._msg_profile = BoundedState(self.max_keys, self.state_ttl, self._now)
+        self._msg_rate = BoundedState(self.max_keys, max(self.msgid_rate_window * 2, 1.0), self._now)
+        self._msg_flood_seen = BoundedState(self.max_keys, self.msgid_rate_window, self._now)
 
     @property
     def rule_count(self) -> int:
@@ -526,6 +543,9 @@ class MavlinkDetector(Detector):
             "mavlink_param_out_of_range": "MAV-PARAM-01",
             "mavlink_command_profile_match": "MAV-CMD-01",
             "mavlink_mission_current": "MAV-MISSION-01",
+            "mavlink_param_read_enumeration": "MAV-READ-SCAN",
+            "mavlink_msgid_novel": "MAV-MSGID-PROFILE",
+            "mavlink_msgid_flood": "MAV-MSGID-RATE",
         }.get(family, "MAV-OBS")
         enabled = self.mode == "enforce" and actionable
         return Evidence(
@@ -553,6 +573,20 @@ class MavlinkDetector(Detector):
             "<fBB16sB", payload)
         name = raw_name.split(b"\x00", 1)[0].decode("ascii", "ignore")
         return name, value, target_system, target_component, param_type
+
+    @staticmethod
+    def _param_request_read(frame: MavFrame):
+        """MAVLink common.xml PARAM_REQUEST_READ(msgid 20) wire 필드 추출
+
+        <hBB16s: param_index(음수면 param_id로 조회), target_sys, target_comp, param_id.
+        attack-agent의 mavlink-telemetry-read 기술이 쓰는 READ 요청이다."""
+        payload = MavlinkDetector._payload(frame, 20)
+        if frame.msgid != 20 or payload is None:
+            return None
+        param_index, target_system, target_component, raw_name = struct.unpack_from(
+            "<hBB16s", payload)
+        name = raw_name.split(b"\x00", 1)[0].decode("ascii", "ignore")
+        return param_index, name, target_system, target_component
 
     @staticmethod
     def _command_long(frame: MavFrame):
@@ -636,6 +670,22 @@ class MavlinkDetector(Detector):
                     f"mavlink_mission_current seq={mission['seq']} command={mission['command']}",
                     actionable=self.require_signed and not frame.signed))
 
+            # PARAM_REQUEST_READ 열거 관찰: 정상 클라이언트는 필요한 소수 파라미터만
+            # 읽지만, telemetry-read 탈취는 flag를 찾으려 param 공간을 훑는다. 짧은 창에서
+            # 서로 다른 param 대상이 임계 초과면 스캔으로 관찰만 남긴다(actionable=False).
+            pread = self._param_request_read(frame)
+            if pread is not None:
+                param_index, pname = pread[0], pread[1]
+                target = pname if param_index < 0 and pname else param_index
+                # 서비스 단위 집계 + surgical(스캔 확장 요청만 근거). 아는 param 재조회는 통과.
+                svc = (flow[3], flow[5]) if isinstance(flow, tuple) and len(flow) == 6 else flow
+                distinct = _track_scan(self._param_reads, svc, [target], now,
+                                       self.param_read_window, self.param_read_scan)
+                if distinct:
+                    hits.append(self._hit(
+                        f"mavlink_param_read_enumeration distinct={distinct}",
+                        actionable=True))   # enforce+포트에서 telemetry-read 스캔 차단
+
             ids = self._ids.get(flow, None, now) or collections.deque()
             ids.append((now, (frame.sysid, frame.compid)))
             while ids and ids[0][0] < now - self.id_window:
@@ -653,6 +703,33 @@ class MavlinkDetector(Detector):
             self._repeat.put(repeat_key, repeats, now)
             if len(repeats) > self.repeat_limit:
                 hits.append(self._hit(f"mavlink_frame_repeat count={len(repeats)} msgid={frame.msgid}"))
+
+            # message-ID 프로파일: warmup 동안 flow별 msgid 집합을 자가학습하고, 이후 신규
+            # msgid 등장을 관찰만 남긴다(정상 미션은 안정된 msgid 집합 — ocslab MAVLink 데이터셋).
+            profile = self._msg_profile.get(flow, None, now)
+            if profile is None:
+                profile = {"seen": set(), "count": 0}
+            if frame.msgid not in profile["seen"]:
+                if profile["count"] >= self.msgid_warmup:
+                    hits.append(self._hit(
+                        f"mavlink_msgid_novel msgid={frame.msgid} (프로파일 밖)",
+                        actionable=False))
+                profile["seen"].add(frame.msgid)
+            profile["count"] += 1
+            self._msg_profile.put(flow, profile, now)
+
+            # msgid별 rate: 특정 msgid flooding(인젝션 증폭, UAV-MAV-021 방향) 관찰. 창당 1회 보고.
+            rate_key = (flow, frame.msgid)
+            stamps = self._msg_rate.get(rate_key, None, now) or collections.deque()
+            stamps.append(now)
+            while stamps and stamps[0] < now - self.msgid_rate_window:
+                stamps.popleft()
+            self._msg_rate.put(rate_key, stamps, now)
+            if len(stamps) > self.msgid_rate_limit and self._msg_flood_seen.get(rate_key, None, now) is None:
+                self._msg_flood_seen.put(rate_key, True, now)
+                hits.append(self._hit(
+                    f"mavlink_msgid_flood msgid={frame.msgid} count={len(stamps)}"
+                    f"/{self.msgid_rate_window:g}s", actionable=False))
         return hits
 
 
@@ -714,13 +791,20 @@ class CcsdsDetector(Detector):
     def __init__(self, mode="observe", ports=None, weight=1.0, max_keys=4096,
                  state_ttl=120.0, confirmations=2, confirm_window=3.0,
                  apids=None, sensitive_commands=None, require_sdls=False,
-                 sdls_trailer_len=36, sdls_key: bytes | None = None, now=None) -> None:
+                 sdls_trailer_len=36, sdls_key: bytes | None = None,
+                 apid_scan_window=10.0, apid_scan_targets=8, now=None) -> None:
         self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
         self.ports = {int(p) for p in (ports or [])}
         self.weight, self.max_keys, self.state_ttl = float(weight), max(32, int(max_keys)), float(state_ttl)
         self._now = now or time.monotonic
         self._seq = BoundedState(self.max_keys, self.state_ttl, self._now)
         self._debounce = EvidenceDebouncer(confirmations, confirm_window, self.max_keys)
+        # APID 열거 관찰: 정상 telemetry는 안정된 소수 APID를 반복하지만, ccsds-tm-read
+        # 탈취는 flag telemetry를 찾으려 APID 공간을 훑는다. 서비스 단위 distinct APID가
+        # 임계 초과면 스캔으로 관찰만 남긴다(actionable=False).
+        self.apid_scan_window = float(apid_scan_window)
+        self.apid_scan_targets = max(1, int(apid_scan_targets))
+        self._apid_scan = BoundedState(self.max_keys, max(self.apid_scan_window * 2, 1.0), self._now)
         self.apids = {int(apid) for apid in (apids or [])}
         self.sensitive_commands = {str(command).upper() for command in (sensitive_commands or [])}
         self.require_sdls = bool(require_sdls)
@@ -737,7 +821,8 @@ class CcsdsDetector(Detector):
         rule_id = ("CCSDS-FECF-01" if family == "ccsds_fecf_invalid" else
                    "CCSDS-02" if family.startswith("ccsds_sequence_") else
                    "CCSDS-SDLS-01" if family.startswith("ccsds_sdls_") else
-                   "CCSDS-CMD-01" if family == "ccsds_sensitive_command" else "CCSDS-OBS")
+                   "CCSDS-CMD-01" if family == "ccsds_sensitive_command" else
+                   "CCSDS-READ-SCAN" if family == "ccsds_apid_enumeration" else "CCSDS-OBS")
         enabled = self.mode == "enforce" and actionable
         return Evidence(
             self.weight if enabled else 0.0, reason, f"ccsds:{family}", rule_id,
@@ -767,6 +852,14 @@ class CcsdsDetector(Detector):
                 hits.append(self._hit(
                     f"ccsds_sequence_regression last={old} current={packet.sequence_count}", confirmed))
         self._seq.put(key, packet.sequence_count, now)
+        # APID 열거: 서비스 단위 + surgical(APID 공간을 확장하는 요청만 근거). 아는 APID
+        # telemetry 재수신은 통과. NAT/재접속 대비 서비스(dst,dport) 키.
+        svc = (flow[3], flow[5]) if isinstance(flow, tuple) and len(flow) == 6 else flow
+        distinct = _track_scan(self._apid_scan, svc, [packet.apid], now,
+                               self.apid_scan_window, self.apid_scan_targets)
+        if distinct:
+            hits.append(self._hit(
+                f"ccsds_apid_enumeration distinct={distinct}", actionable=True))
         if packet.has_fecf and packet.fecf_valid is False:
             hits.append(self._hit(f"ccsds_fecf_invalid apid={packet.apid}"))
         command = packet.payload.rstrip(b"\x00").decode("ascii", "ignore").strip().upper()
@@ -796,6 +889,9 @@ class CcsdsDetector(Detector):
 
 
 # ── RTPS/DDS 관찰기 ─────────────────────────────────────────────────────────
+_RTPS_DATA_KINDS = frozenset({0x15, 0x16})   # DATA, DATA_FRAG
+
+
 @dataclass(frozen=True)
 class RtpsMessage:
     version: tuple[int, int]
@@ -803,12 +899,14 @@ class RtpsMessage:
     guid_prefix: bytes
     submessages: tuple[tuple[int, int], ...]
     malformed: bool = False
+    # DATA/DATA_FRAG 서브메시지에서 뽑은 (readerId, writerId) 목록. topic/reader 열거 관찰용.
+    endpoints: tuple[tuple[bytes, bytes], ...] = ()
 
 
 def parse_rtps_message(data: bytes) -> RtpsMessage | None:
     if len(data) < 20 or data[:4] != b"RTPS":
         return None
-    off, submessages, malformed = 20, [], False
+    off, submessages, endpoints, malformed = 20, [], [], False
     while off < len(data):
         if off + 4 > len(data):
             malformed = True
@@ -821,9 +919,14 @@ def parse_rtps_message(data: bytes) -> RtpsMessage | None:
             malformed = True
             break
         submessages.append((kind, body_end - off - 4))
+        if kind in _RTPS_DATA_KINDS:
+            # DATA 본문: extraFlags(2) octetsToInlineQos(2) readerId(4) writerId(4) ...
+            body = data[off + 4:body_end]
+            if len(body) >= 12:
+                endpoints.append((body[4:8], body[8:12]))   # readerId, writerId(=topic)
         off = body_end
     return RtpsMessage((data[4], data[5]), data[6:8], data[8:20],
-                       tuple(submessages), malformed)
+                       tuple(submessages), malformed, tuple(endpoints))
 
 
 class RtpsDetector(Detector):
@@ -832,7 +935,7 @@ class RtpsDetector(Detector):
     name = "rtps"
 
     def __init__(self, mode="observe", ports=None, weight=1.0, guid_window=10.0,
-                 max_guids=32, max_keys=4096, now=None) -> None:
+                 max_guids=32, max_keys=4096, topic_window=10.0, topic_scan=16, now=None) -> None:
         self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
         self.ports = {int(p) for p in (ports or [])}
         self.weight, self.guid_window = float(weight), float(guid_window)
@@ -841,6 +944,12 @@ class RtpsDetector(Detector):
         ttl = max(self.guid_window * 2, 1.0)
         self._guids = BoundedState(self.max_keys, ttl, self._now)
         self._profile = BoundedState(self.max_keys, ttl, self._now)
+        # topic 열거 관찰: SPDP discovery는 소수 builtin writer를 반복하지만, ros2-topic-read
+        # 탈취는 flag 담은 topic을 찾으려 여러 topic(writerId)을 훑는다. 서비스 단위 distinct
+        # writerId가 임계 초과면 스캔으로 관찰만 남긴다(actionable=False).
+        self.topic_window = float(topic_window)
+        self.topic_scan = max(1, int(topic_scan))
+        self._topics = BoundedState(self.max_keys, max(self.topic_window * 2, 1.0), self._now)
 
     @property
     def rule_count(self):
@@ -852,6 +961,7 @@ class RtpsDetector(Detector):
             "rtps_submessage_malformed": "RTPS-02",
             "rtps_profile_changed": "RTPS-PROFILE-01",
             "rtps_guid_churn": "RTPS-DISCOVERY-OBS-01",
+            "rtps_topic_enumeration": "RTPS-READ-SCAN",
         }.get(family, "RTPS-OBS")
         enabled = self.mode == "enforce" and actionable
         return Evidence(
@@ -882,6 +992,16 @@ class RtpsDetector(Detector):
         self._guids.put(flow, q, now)
         if len({guid for _, guid in q}) > self.max_guids:
             hits.append(self._hit(f"rtps_guid_churn unique>{self.max_guids}"))
+        if msg.endpoints:
+            # topic 열거: 서비스 단위 + surgical(새 topic writerId를 도입하는 요청만 근거).
+            # 아는 topic 재구독은 통과. SPDP discovery(소수 builtin writer 반복)도 무신호.
+            svc = (flow[3], flow[5]) if isinstance(flow, tuple) and len(flow) == 6 else flow
+            writers = [writer for _reader, writer in msg.endpoints]
+            distinct = _track_scan(self._topics, svc, writers, now,
+                                   self.topic_window, self.topic_scan)
+            if distinct:
+                hits.append(self._hit(
+                    f"rtps_topic_enumeration distinct={distinct}", actionable=True))
         return hits
 
 
@@ -913,11 +1033,24 @@ class ModbusDetector(Detector):
     """
 
     name = "modbus"
+    # FC01/02 read coils·discrete, 03/04 read holding·input registers는 PDU가
+    # FC(1)+시작주소(2)+수량(2) 구조라 스캔 대상(주소)을 뽑을 수 있다.
+    _MODBUS_ADDR_FCS = frozenset({0x01, 0x02, 0x03, 0x04})
 
-    def __init__(self, mode="observe", ports=None, weight=1.0) -> None:
+    def __init__(self, mode="observe", ports=None, weight=1.0,
+                 read_window=5.0, read_scan_targets=16, max_keys=4096, now=None) -> None:
         self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
         self.ports = {int(p) for p in (ports or [])}
         self.weight = float(weight)
+        # read enumeration 관찰: 정상 폴링은 소수의 고정 레지스터를 반복 조회하지만,
+        # attack-agent의 modbus-read-regs(P1)는 flag를 찾으려 주소 공간을 훑는다. 짧은
+        # 창 안에서 서로 다른 read 대상이 임계 초과로 관측되면 스캔으로 관찰만 남긴다
+        # (baseline 없이 강제 차단하지 않는다 — actionable=False, 규칙 4).
+        self.read_window = float(read_window)
+        self.read_scan_targets = max(1, int(read_scan_targets))
+        self._now = now or time.monotonic
+        self._reads = BoundedState(max(32, int(max_keys)),
+                                   max(self.read_window * 2, 1.0), self._now)
 
     @property
     def rule_count(self):
@@ -940,17 +1073,453 @@ class ModbusDetector(Detector):
         tid, proto_id, length, unit = struct.unpack(">HHHB", payload[:7])
         if proto_id != 0:                            # ProtocolId!=0 → Modbus 아님, 판정 보류
             return []
-        # 선언 Length와 실제 남은 byte 수가 정확히 일치할 때만 well-formed 프레임으로 취급한다.
-        # Modbus/TCP는 응답을 기다리지 않고 여러 요청을 연속 전송(pipelining)할 수 있어,
-        # 불일치를 곧장 구조 위반으로 판정하면 다음 메시지가 섞여 들어온 정상 트래픽을
-        # 오탐할 위험이 있다. CCSDS parser와 동일하게 불일치 시 판정을 보류(빈 목록)한다.
+        hits: list[Evidence] = []
+        # 쓰기 관찰(보수적 경로): 선언 Length와 실제 남은 byte 수가 정확히 일치할 때만
+        # well-formed 단일 프레임으로 취급한다. Modbus/TCP는 pipelining이 가능해, 불일치를
+        # 곧장 구조 위반으로 판정하면 정상 트래픽을 오탐할 위험이 있어 판정을 보류한다.
+        # 쓰기·진단 함수 코드는 baseline 없이 강제 차단하지 않으므로 관찰만(actionable=False).
         pdu = payload[7:]
-        if length != len(pdu) + 1 or not pdu:
+        if length == len(pdu) + 1 and pdu:
+            fc = pdu[0] & ~_MODBUS_EXCEPTION_BIT
+            if fc not in _MODBUS_READ_FCS:
+                hits.append(self._hit(f"modbus_non_read_function_code 0x{fc:02x}",
+                                      "MODBUS-WRITE-FC", actionable=False))
+        # read enumeration(관찰 전용): 재조립 버퍼 안의 연속 MBAP 프레임을 훑어 read 대상을
+        # 집계한다. 관찰 전용이라 pipelining 버퍼를 훑어도 차단 위험이 없어, 보수적 단일
+        # 프레임 경로가 놓치는 "한 연결에서 연속 read로 주소 공간을 훑는" 실제 스캔을 잡는다.
+        hits += self._read_enumeration(ctx, payload)
+        return hits
+
+    def _read_targets(self, payload: bytes) -> list[tuple[int, int | None]]:
+        """재조립 버퍼의 연속 MBAP 프레임을 훑어 read (fc, addr) 대상을 순서대로 반환.
+
+        선언 Length가 남은 byte를 벗어나거나 ProtocolId!=0이면 그 지점에서 중단한다
+        (부분 프레임·다른 프로토콜을 스캔 대상으로 오인하지 않는다). 프레임 수는 상한을
+        둬 재조립 버퍼가 커도 비용이 제한되게 한다."""
+        off, targets, count = 0, [], 0
+        while off + 7 <= len(payload) and count < 64:
+            proto_id, length = struct.unpack_from(">HH", payload, off + 2)
+            if proto_id != 0 or length < 2:
+                break
+            frame_end = off + 6 + length          # tid2+proto2+len2 + length(=unit+pdu)
+            if frame_end > len(payload):
+                break
+            pdu = payload[off + 7:frame_end]
+            if pdu:
+                fc = pdu[0] & ~_MODBUS_EXCEPTION_BIT
+                if fc in _MODBUS_READ_FCS:
+                    addr = (int.from_bytes(pdu[1:3], "big")
+                            if fc in self._MODBUS_ADDR_FCS and len(pdu) >= 5 else None)
+                    targets.append((fc, addr))
+            off, count = frame_end, count + 1
+        return targets
+
+    def _service_key(self, ctx: PacketContext):
+        """집계 키. NAT로 source IP가 무의미하고 스캐너가 재접속할 수 있어, 연결(5-tuple)이
+        아니라 서비스(dst, dport) 단위로 묶는다."""
+        flow = ctx.flow
+        if flow and len(flow) == 6:
+            return (flow[3], flow[5])              # dst, dport
+        return (ctx.proto, ctx.dport)
+
+    def _read_enumeration(self, ctx: PacketContext, payload: bytes) -> list[Evidence]:
+        """서비스 단위 read 주소 스캔 관찰. 스캔을 확장하는 요청만 근거를 남긴다(surgical).
+
+        정상 클라이언트가 아는 레지스터를 재조회하는 요청은, 다른 누군가 스캔 중이라도 새 대상을
+        도입하지 않으므로 통과한다. `_track_scan`이 확장 요청에서만 distinct를 반환한다."""
+        targets = self._read_targets(payload)
+        if not targets:
             return []
-        fc = pdu[0] & ~_MODBUS_EXCEPTION_BIT
-        if fc in _MODBUS_READ_FCS:
+        distinct = _track_scan(self._reads, self._service_key(ctx), targets, self._now(),
+                               self.read_window, self.read_scan_targets)
+        if distinct:
+            return [self._hit(f"modbus_read_enumeration distinct={distinct}",
+                              "MODBUS-READ-SCAN", actionable=True)]
+        return []
+
+
+# ── 새 방산 프로토콜 공통 유틸 (UDS/CAN, IEC-104, SNMP) ─────────────────────────
+# 2026-08-20 attack-agent origin/main(PR #19~#25) 분석에서 추가로 확인된 실행 가능 프로토콜.
+# 셋 다 read-only 탈취이고 attack-agent가 read recast만 실행 계획으로 둔다(제24조). 우리는
+# Modbus와 동일한 보수적 doctrine으로 관찰만: 포트 profile 요구, 열거는 OBSERVATION_ONLY.
+def _svc_key(ctx: PacketContext):
+    """열거 집계 키. NAT로 source IP가 무의미하고 스캐너가 재접속하므로 서비스(dst,dport) 단위."""
+    flow = ctx.flow
+    if isinstance(flow, tuple) and len(flow) == 6:
+        return (flow[3], flow[5])
+    return (ctx.proto, ctx.dport)
+
+
+def _track_scan(state: BoundedState, key, targets, now, window, threshold):
+    """{target: 마지막 관측 시각} dict + TTL로 distinct 대상 추적. **surgical** 버전.
+
+    임계를 넘고 **이번 요청이 스캔을 확장할 때만**(창 안에서 처음 보는 대상을 도입) distinct
+    수를 반환, 아니면 None. 즉 정상 클라이언트가 이미 아는 대상을 재조회하는 요청은, 다른
+    누군가 스캔 중이라 서비스 distinct가 임계를 넘었더라도 근거를 만들지 않아 통과한다.
+    "프로토콜을 통째로 막는" 게 아니라 스캔을 확장하는 요청만 잡기 위한 것이다.
+    상한(cap)으로 메모리를 제한한다. Modbus/MAVLink/CCSDS/RTPS도 같은 방식.
+    """
+    prev = state.get(key, None, now) or {}
+    expanded = any(target not in prev for target in targets)   # 창 안에서 처음 보는 대상?
+    seen = dict(prev)
+    for target in targets:
+        seen[target] = now
+    cutoff = now - window
+    seen = {t: ts for t, ts in seen.items() if ts >= cutoff}
+    cap = threshold * 8
+    if len(seen) > cap:
+        seen = dict(sorted(seen.items(), key=lambda kv: kv[1])[-cap:])
+    state.put(key, seen, now)
+    return len(seen) if (len(seen) > threshold and expanded) else None
+
+
+# UDS(ISO 14229) 읽기 SID — attack-agent가 read recast로 실행하는 목록
+#   0x22 ReadDataByIdentifier, 0x19 ReadDTCInformation, 0x3E TesterPresent,
+#   0x1A ReadDataByLocalId(legacy), 0x23 ReadMemoryByAddress
+_UDS_READ_SIDS = frozenset({0x22, 0x19, 0x3E, 0x1A, 0x23})
+
+
+class UdsCanDetector(Detector):
+    """UDS-over-CAN-over-TCP 게이트웨이 관찰 (L4 UGV 차량 버스)
+
+    2026-08-20 attack-agent origin/main 분석에서 확인 — `protocols.py`의 `can_uds_read`가
+    P1로 지정. CloudCar/ASRG류 CTF처럼 텔레메틱스/teleop 게이트웨이가 차량 CAN 버스를 노출하고,
+    UDS ReadDataByIdentifier(0x22)로 DID(예: VIN 0xF190)를 읽어 flag를 탈취한다.
+
+    게이트웨이 wire: `arbitration_id(4,BE,29bit) | len(1) | payload(len)`. CAN에는 magic이 없어
+    Modbus와 동일하게 port profile을 identification 전제조건으로 둔다(포트 설정 전 무증거).
+    쓰기·루틴 SID(0x2E/0x2F/0x31/0x34 등)는 정상 진단 트래픽과 구분할 baseline이 없어 관찰만.
+    """
+
+    name = "uds_can"
+
+    def __init__(self, mode="observe", ports=None, weight=1.0,
+                 read_window=5.0, read_scan_targets=16, max_keys=4096, now=None) -> None:
+        self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
+        self.ports = {int(p) for p in (ports or [])}
+        self.weight = float(weight)
+        self.read_window = float(read_window)
+        self.read_scan_targets = max(1, int(read_scan_targets))
+        self._now = now or time.monotonic
+        self._reads = BoundedState(max(32, int(max_keys)), max(self.read_window * 2, 1.0), self._now)
+
+    @property
+    def rule_count(self):
+        return 0 if self.mode == "off" else 1
+
+    def _hit(self, reason, rule_id, actionable=True):
+        enabled = self.mode == "enforce" and actionable
+        return Evidence(
+            self.weight if enabled else 0.0, reason, f"uds:{rule_id}", rule_id,
+            EvidenceClass.CONTEXT_REQUIRED if enabled else EvidenceClass.OBSERVATION_ONLY,
+            IdentificationBasis.PROFILE_BOUND, bool(self.ports), enabled, True)
+
+    def _frames(self, payload: bytes):
+        """CAN-over-TCP 연속 프레임 walk. 선언 길이를 벗어나면 그 지점에서 중단."""
+        off, out, count = 0, [], 0
+        while off + 5 <= len(payload) and count < 64:
+            plen = payload[off + 4]
+            end = off + 5 + plen
+            if plen == 0 or end > len(payload):
+                break
+            out.append(payload[off + 5:end])           # UDS PDU
+            off, count = end, count + 1
+        return out
+
+    def inspect(self, ctx: PacketContext) -> list[Evidence]:
+        if self.mode == "off" or not self.ports or ctx.proto != 6 or ctx.dport not in self.ports:
             return []
-        # 쓰기·진단 함수 코드는 정상 제어 트래픽인지 공격인지 구분할 baseline이 없어
-        # observe 전용으로 고정한다(actionable=False) — enforce 모드에서도 차단하지 않는다.
-        return [self._hit(f"modbus_non_read_function_code 0x{fc:02x}",
-                          "MODBUS-WRITE-FC", actionable=False)]
+        hits, read_targets = [], []
+        for pdu in self._frames(ctx.payload):
+            if not pdu:
+                continue
+            sid = pdu[0]
+            if sid in _UDS_READ_SIDS:
+                did = int.from_bytes(pdu[1:3], "big") if sid == 0x22 and len(pdu) >= 3 else None
+                read_targets.append((sid, did))
+            elif sid < 0x40:                            # 요청 SID(응답 0x40+/0x7F 제외) 중 비-read
+                hits.append(self._hit(f"uds_non_read_sid 0x{sid:02x}", "UDS-WRITE-SID",
+                                      actionable=False))
+        if read_targets:
+            distinct = _track_scan(self._reads, _svc_key(ctx), read_targets, self._now(),
+                                   self.read_window, self.read_scan_targets)
+            if distinct:
+                hits.append(self._hit(f"uds_did_enumeration distinct={distinct}",
+                                      "UDS-READ-SCAN", actionable=True))
+        return hits
+
+
+# IEC 60870-5-104 읽기/심문 type id — attack-agent iec104_read
+#   102 C_RD_NA_1(read), 100 C_IC_NA_1(general interrogation). 제어(45~51 등)는 관찰만.
+_IEC104_READ_TYPES = frozenset({100, 102})
+
+
+class Iec104Detector(Detector):
+    """IEC 60870-5-104 관찰 (OT/지상 관제)
+
+    2026-08-20 attack-agent 분석에서 확인 — `iec104_read`(P2). C_RD_NA_1(102)/C_IC_NA_1(100)로
+    IOA(정보객체주소)를 읽어 flag를 탈취한다. APCI I-format: `0x68 | len | ctrl(4) | ASDU`.
+    ASDU: type_id(1) | VSQ(1) | COT(2,LE) | CA(2,LE) | IOA(3,LE) ... 제어 명령은 관찰만.
+    magic 0x68이 있지만 1byte라 약해, Modbus와 동일하게 port profile을 전제조건으로 둔다.
+    """
+
+    name = "iec104"
+
+    def __init__(self, mode="observe", ports=None, weight=1.0,
+                 read_window=5.0, read_scan_targets=16, max_keys=4096, now=None) -> None:
+        self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
+        self.ports = {int(p) for p in (ports or [])}
+        self.weight = float(weight)
+        self.read_window = float(read_window)
+        self.read_scan_targets = max(1, int(read_scan_targets))
+        self._now = now or time.monotonic
+        self._reads = BoundedState(max(32, int(max_keys)), max(self.read_window * 2, 1.0), self._now)
+
+    @property
+    def rule_count(self):
+        return 0 if self.mode == "off" else 1
+
+    def _hit(self, reason, rule_id, actionable=True):
+        enabled = self.mode == "enforce" and actionable
+        return Evidence(
+            self.weight if enabled else 0.0, reason, f"iec104:{rule_id}", rule_id,
+            EvidenceClass.CONTEXT_REQUIRED if enabled else EvidenceClass.OBSERVATION_ONLY,
+            IdentificationBasis.PROFILE_BOUND, bool(self.ports), enabled, True)
+
+    def _apdus(self, payload: bytes):
+        """연속 APCI APDU walk. start(0x68)·길이가 어긋나면 그 지점에서 중단. ASDU만 반환."""
+        off, out, count = 0, [], 0
+        while off + 6 <= len(payload) and count < 64:
+            if payload[off] != 0x68:
+                break
+            length = payload[off + 1]
+            end = off + 2 + length
+            if length < 4 or end > len(payload):
+                break
+            ctrl = payload[off + 2:off + 6]
+            asdu = payload[off + 6:end]
+            if not (ctrl[0] & 0x01):                    # I-format(bit0=0)만 ASDU를 나른다
+                out.append(asdu)
+            off, count = end, count + 1
+        return out
+
+    def inspect(self, ctx: PacketContext) -> list[Evidence]:
+        if self.mode == "off" or not self.ports or ctx.proto != 6 or ctx.dport not in self.ports:
+            return []
+        hits, read_targets = [], []
+        for asdu in self._apdus(ctx.payload):
+            if len(asdu) < 9:                           # type+VSQ+COT(2)+CA(2)+IOA(3)
+                continue
+            type_id = asdu[0]
+            ioa = int.from_bytes(asdu[6:9], "little")
+            if type_id in _IEC104_READ_TYPES:
+                read_targets.append((type_id, ioa))
+            elif 45 <= type_id <= 69:                   # C_SC/C_DC/C_RC/C_SE 등 제어 명령대
+                hits.append(self._hit(f"iec104_control_command type={type_id}",
+                                      "IEC104-CTRL", actionable=False))
+        if read_targets:
+            distinct = _track_scan(self._reads, _svc_key(ctx), read_targets, self._now(),
+                                   self.read_window, self.read_scan_targets)
+            if distinct:
+                hits.append(self._hit(f"iec104_ioa_enumeration distinct={distinct}",
+                                      "IEC104-READ-SCAN", actionable=True))
+        return hits
+
+
+def _ber_tlv(data: bytes, off: int):
+    """BER TLV 하나를 읽어 (tag, value_start, value_end, next_off) 반환. 파싱 실패 시 None."""
+    if off + 2 > len(data):
+        return None
+    tag = data[off]
+    length = data[off + 1]
+    vstart = off + 2
+    if length & 0x80:                                   # long-form length
+        nbytes = length & 0x7F
+        if nbytes == 0 or nbytes > 4 or vstart + nbytes > len(data):
+            return None
+        length = int.from_bytes(data[vstart:vstart + nbytes], "big")
+        vstart += nbytes
+    vend = vstart + length
+    if vend > len(data):
+        return None
+    return tag, vstart, vend, vend
+
+
+# SNMP PDU tag — 읽기: GetRequest/GetNext/GetBulk. 쓰기: SetRequest(0xA3).
+_SNMP_READ_PDUS = frozenset({0xA0, 0xA1, 0xA5})
+_SNMP_SET_PDU = 0xA3
+
+
+class SnmpDetector(Detector):
+    """SNMP v1/v2c 관찰 (지상/NOC 장비 M&C 읽기)
+
+    2026-08-20 attack-agent 분석에서 확인 — `snmp_v2c_get`(P2). GetRequest로 OID를 읽어 flag를
+    탈취한다(satcom 지상장비 모니터링). BER: `SEQUENCE{ version(INT), community(OCTETSTRING),
+    PDU }`. PDU tag가 0xA0/0xA1/0xA5면 읽기, 0xA3(SetRequest)면 쓰기(관찰만). BER 0x30이 흔해
+    Modbus와 동일하게 port profile을 전제조건으로 둔다(SNMP는 보통 UDP/161).
+    """
+
+    name = "snmp"
+
+    def __init__(self, mode="observe", ports=None, weight=1.0,
+                 read_window=10.0, read_scan_targets=16, max_keys=4096, now=None) -> None:
+        self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
+        self.ports = {int(p) for p in (ports or [])}
+        self.weight = float(weight)
+        self.read_window = float(read_window)
+        self.read_scan_targets = max(1, int(read_scan_targets))
+        self._now = now or time.monotonic
+        self._reads = BoundedState(max(32, int(max_keys)), max(self.read_window * 2, 1.0), self._now)
+
+    @property
+    def rule_count(self):
+        return 0 if self.mode == "off" else 1
+
+    def _hit(self, reason, rule_id, actionable=True):
+        enabled = self.mode == "enforce" and actionable
+        return Evidence(
+            self.weight if enabled else 0.0, reason, f"snmp:{rule_id}", rule_id,
+            EvidenceClass.CONTEXT_REQUIRED if enabled else EvidenceClass.OBSERVATION_ONLY,
+            IdentificationBasis.PROFILE_BOUND, bool(self.ports), enabled, True)
+
+    @staticmethod
+    def _oids(pdu_value: bytes) -> list[bytes]:
+        """PDU 값에서 varbindlist를 찾아 각 varbind의 OID(tag 0x06) 바이트를 반환."""
+        oids: list[bytes] = []
+        # PDU: request_id(INT) error_status(INT) error_index(INT) varbindlist(SEQUENCE)
+        off = 0
+        vbl = None
+        for _ in range(4):
+            tlv = _ber_tlv(pdu_value, off)
+            if tlv is None:
+                break
+            tag, vs, ve, nxt = tlv
+            if tag == 0x30:                             # varbindlist SEQUENCE
+                vbl = (vs, ve)
+                break
+            off = nxt
+        if vbl is None:
+            return oids
+        off, end = vbl
+        while off < end and len(oids) < 64:
+            vb = _ber_tlv(pdu_value, off)               # varbind SEQUENCE
+            if vb is None or vb[0] != 0x30:
+                break
+            _t, vs, ve, nxt = vb
+            oid = _ber_tlv(pdu_value, vs)               # 첫 요소 = OID
+            if oid is not None and oid[0] == 0x06:
+                oids.append(pdu_value[oid[1]:oid[2]])
+            off = nxt
+        return oids
+
+    def inspect(self, ctx: PacketContext) -> list[Evidence]:
+        if self.mode == "off" or not self.ports or ctx.dport not in self.ports:
+            return []
+        data = ctx.segment_payload or ctx.payload
+        outer = _ber_tlv(data, 0)
+        if outer is None or outer[0] != 0x30 or outer[2] != len(data):
+            return []                                   # 최상위 SEQUENCE가 전체와 일치할 때만
+        off = outer[1]
+        version = _ber_tlv(data, off)                   # INTEGER version
+        if version is None or version[0] != 0x02:
+            return []
+        community = _ber_tlv(data, version[3])          # OCTET STRING community
+        if community is None or community[0] != 0x04:
+            return []
+        pdu = _ber_tlv(data, community[3])
+        if pdu is None:
+            return []
+        tag = pdu[0]
+        if tag == _SNMP_SET_PDU:
+            return [self._hit("snmp_set_request", "SNMP-SET", actionable=False)]
+        if tag not in _SNMP_READ_PDUS:
+            return []
+        oids = self._oids(data[pdu[1]:pdu[2]])
+        if not oids:
+            return []
+        distinct = _track_scan(self._reads, _svc_key(ctx), oids, self._now(),
+                               self.read_window, self.read_scan_targets)
+        if distinct:
+            return [self._hit(f"snmp_oid_enumeration distinct={distinct}",
+                              "SNMP-READ-SCAN", actionable=True)]
+        return []
+
+
+def parse_tls_client_hello(data: bytes):
+    """TLS ClientHello에서 (version(major,minor), sni) 추출. TLS/ClientHello가 아니면 None.
+
+    구조 근거만 사용(payload 복호화 아님). SNI 파싱 실패 시 (version, None)을 반환한다.
+    """
+    if len(data) < 43 or data[0] != 0x16 or data[1] != 0x03 or data[5] != 0x01:
+        return None                                     # record 0x16 handshake, 0x03 TLS1.x, hs 0x01 ClientHello
+    version = (data[9], data[10])                       # client_version
+    off = 43                                            # 5(record) + 4(hs hdr) + 2(ver) + 32(random)
+    try:
+        sid_len = data[off]
+        off += 1 + sid_len
+        cs_len = int.from_bytes(data[off:off + 2], "big")
+        off += 2 + cs_len
+        comp_len = data[off]
+        off += 1 + comp_len
+        ext_total = int.from_bytes(data[off:off + 2], "big")
+        off += 2
+        end = min(len(data), off + ext_total)
+        while off + 4 <= end:
+            etype = int.from_bytes(data[off:off + 2], "big")
+            elen = int.from_bytes(data[off + 2:off + 4], "big")
+            body = data[off + 4:off + 4 + elen]
+            if etype == 0x0000 and len(body) >= 5:      # server_name extension
+                name_len = int.from_bytes(body[3:5], "big")
+                return version, body[5:5 + name_len].decode("ascii", "ignore")
+            off += 4 + elen
+    except (IndexError, ValueError):
+        pass
+    return version, None
+
+
+class TlsObserveDetector(Detector):
+    """TLS 채널 관찰기 — 암호화로 payload 기반 방산 detector가 무력화되는 지점을 표시
+
+    2026-08-20 attack-agent origin/main 분석에서 확인 — harness가 verify-off TLS 컨텍스트로
+    raw-TLS/https probe를 보낸다(`import ssl`). 방산 프로토콜이 TLS로 감싸지면 우리 payload
+    파서는 암호문만 보므로 구조적으로 탐지 불가하다. 복호화는 불가능하니, 최소한 "이 포트는
+    암호화 채널(SNI=…)이라 protocol detector가 blind"임을 ClientHello에서 관찰해 운영자에게
+    알린다. 항상 관찰 전용(actionable=False) — 차단하지 않는다.
+    """
+
+    name = "tls_observe"
+
+    def __init__(self, mode="observe", ports=None, weight=1.0,
+                 max_keys=4096, state_ttl=300.0, now=None) -> None:
+        self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
+        self.ports = {int(p) for p in (ports or [])}
+        self.weight = float(weight)
+        self._now = now or time.monotonic
+        # 같은 flow의 ClientHello를 한 번만 보고(핸드셰이크 반복 로그 방지)
+        self._seen = BoundedState(max(32, int(max_keys)), float(state_ttl), self._now)
+
+    @property
+    def rule_count(self):
+        return 0 if self.mode == "off" else 1
+
+    def _hit(self, reason):
+        return Evidence(
+            0.0, reason, "tls:channel", "TLS-CHANNEL-OBS",
+            EvidenceClass.OBSERVATION_ONLY, IdentificationBasis.STRUCTURE_VERIFIED,
+            True, False, True)
+
+    def inspect(self, ctx: PacketContext) -> list[Evidence]:
+        if self.mode == "off" or (self.ports and ctx.dport not in self.ports):
+            return []
+        parsed = parse_tls_client_hello(ctx.segment_payload or ctx.payload)
+        if parsed is None:
+            return []
+        flow = ctx.flow or (ctx.proto, ctx.dport)
+        now = self._now()
+        if self._seen.get(flow, None, now) is not None:
+            return []                                   # flow당 1회만
+        self._seen.put(flow, True, now)
+        (major, minor), sni = parsed
+        return [self._hit(
+            f"tls_channel version={major}.{minor} port={ctx.dport} "
+            f"sni={sni or '?'} (payload 기반 detector blind)")]

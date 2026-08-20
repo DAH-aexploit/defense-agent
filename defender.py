@@ -35,10 +35,10 @@ import urllib.request
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from detectors import (CcsdsDetector, Evidence, EvidenceClass,
+from detectors import (CcsdsDetector, Evidence, EvidenceClass, Iec104Detector,
                        IdentificationBasis, MavlinkDetector, ModbusDetector, PacketContext,
                        ParamRangeDetector, RequestBurstDetector, RtpsDetector,
-                       SignatureDetector)
+                       SignatureDetector, SnmpDetector, TlsObserveDetector, UdsCanDetector)
 # 리허설 스켈레톤 전용 검사기 — 본선 무관, DAH2026_본선_방산프로토콜_준비.md 참조
 from rehearsal_web_detectors import (AuthSessionDetector, L3ProductIdDetector,
                                      McsScriptTraversalDetector, UrlSsrGuardDetector)
@@ -85,16 +85,25 @@ LLM_QUEUE_MAX_AGE_SECONDS = _env_number(
     "DEF_LLM_QUEUE_MAX_AGE_SECONDS", 30.0, float, 1.0)
 UNKNOWN_SAMPLE_LIMIT = _env_number("DEF_UNKNOWN_SAMPLE_LIMIT", 24, int, 0)
 UNKNOWN_SAMPLES_PER_PORT = _env_number("DEF_UNKNOWN_SAMPLES_PER_PORT", 2, int, 1)
-MAVLINK_MODE = os.environ.get("DEF_MAVLINK_MODE", "observe").lower()
+# 2026-08-20 정책 전환(사용자 지시): flag 유출 차단 1순위 + 인바운드 전용 제약상, read 열거
+# 스캔을 응답 전에 차단해야 한다. 방산 detector 기본을 enforce로 둔다. 단 전부 port profile로
+# gating되므로 DEF_*_PORTS 미설정 시엔 차단하지 않는다(본선에서 포트 확인 후 발동). SLA가
+# 떨어지면 해당 프로토콜만 DEF_<P>_MODE=observe로 즉시 되돌린다. TLS는 복호화 불가라 observe 고정.
+MAVLINK_MODE = os.environ.get("DEF_MAVLINK_MODE", "enforce").lower()
 try:
     MAVLINK_PORTS = [int(p) for p in os.environ.get("DEF_MAVLINK_PORTS", "").split(",")
                      if p.strip()]
 except ValueError:
     MAVLINK_PORTS = []  # 잘못된 설정 하나 때문에 defender가 기동 실패하지 않게 관찰 범위로 강등
 MAVLINK_REQUIRE_SIGNED = os.environ.get("DEF_MAVLINK_REQUIRE_SIGNED", "0") == "1"
-CCSDS_MODE = os.environ.get("DEF_CCSDS_MODE", "observe").lower()
-RTPS_MODE = os.environ.get("DEF_RTPS_MODE", "observe").lower()
-MODBUS_MODE = os.environ.get("DEF_MODBUS_MODE", "observe").lower()
+CCSDS_MODE = os.environ.get("DEF_CCSDS_MODE", "enforce").lower()
+RTPS_MODE = os.environ.get("DEF_RTPS_MODE", "enforce").lower()
+MODBUS_MODE = os.environ.get("DEF_MODBUS_MODE", "enforce").lower()
+# 2026-08-20 attack-agent origin/main에서 추가 확인된 read-only 프로토콜(enforce+포트 시 스캔 차단)
+UDS_CAN_MODE = os.environ.get("DEF_UDS_CAN_MODE", "enforce").lower()
+IEC104_MODE = os.environ.get("DEF_IEC104_MODE", "enforce").lower()
+SNMP_MODE = os.environ.get("DEF_SNMP_MODE", "enforce").lower()
+TLS_MODE = os.environ.get("DEF_TLS_MODE", "observe").lower()
 
 # 리허설 스켈레톤 전용 검사기 설정 — 본선 무관, rehearsal_web_detectors.py 참조
 URL_GUARD_MODE = os.environ.get("DEF_URL_GUARD_MODE", "enforce").lower()
@@ -114,6 +123,9 @@ def _env_ports(name: str) -> list[int]:
 CCSDS_PORTS = _env_ports("DEF_CCSDS_PORTS")
 RTPS_PORTS = _env_ports("DEF_RTPS_PORTS")
 MODBUS_PORTS = _env_ports("DEF_MODBUS_PORTS")
+UDS_CAN_PORTS = _env_ports("DEF_UDS_CAN_PORTS")
+IEC104_PORTS = _env_ports("DEF_IEC104_PORTS")
+SNMP_PORTS = _env_ports("DEF_SNMP_PORTS")
 
 # 리허설 스켈레톤 전용 — 본선 무관
 URL_GUARD_PORTS = _env_ports("DEF_URL_GUARD_PORTS") or [8082]
@@ -623,6 +635,10 @@ _IMPLEMENTED_RULE_IDS = {
     "SAT-SDLS-001", "SAT-SDLS-002", "MCS-RTPS-001", "MCS-RTPS-003",
     "UAV-MAV-001", "UAV-MAV-002", "UAV-MAV-003", "UAV-MAV-004",
     "UAV-MAV-005",
+    # UAV-MAV-021(msgid별 요청률): MavlinkDetector가 msgid 프로파일·rate를 관찰한다(2026-08-20,
+    # ocslab MAVLink 데이터셋 반영). 증폭비·bandwidth/CPU budget 검증까지는 아니라 관찰(OBSERVED)
+    # 수준이며, 정상 baseline 확인 후에만 enforce 판단.
+    "UAV-MAV-021",
 }
 
 _ALWAYS_ENFORCED_RULE_IDS = {"COM-IP4-001", "COM-UDP-001"}
@@ -720,6 +736,14 @@ def load_engine() -> VerdictEngine:
         extra.append(RtpsDetector(mode=RTPS_MODE, ports=RTPS_PORTS))
     if MODBUS_MODE != "off":
         extra.append(ModbusDetector(mode=MODBUS_MODE, ports=MODBUS_PORTS))
+    if UDS_CAN_MODE != "off":
+        extra.append(UdsCanDetector(mode=UDS_CAN_MODE, ports=UDS_CAN_PORTS))
+    if IEC104_MODE != "off":
+        extra.append(Iec104Detector(mode=IEC104_MODE, ports=IEC104_PORTS))
+    if SNMP_MODE != "off":
+        extra.append(SnmpDetector(mode=SNMP_MODE, ports=SNMP_PORTS))
+    if TLS_MODE != "off":                            # 암호화 채널 관찰(차단 안 함) — 포트 무관
+        extra.append(TlsObserveDetector(mode=TLS_MODE))
     # 리허설 스켈레톤 전용 — 본선 무관, DAH2026_본선_방산프로토콜_준비.md 참조
     if URL_GUARD_MODE != "off":
         extra.append(UrlSsrGuardDetector(

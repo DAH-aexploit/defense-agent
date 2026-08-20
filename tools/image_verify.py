@@ -13,7 +13,8 @@ import sys
 
 sys.path.insert(0, "/app")
 from defender import VERDICT_ACCEPT, VERDICT_DROP, VerdictEngine, load_engine
-from detectors import ModbusDetector
+from detectors import (CcsdsDetector, Iec104Detector, MavlinkDetector, ModbusDetector,
+                       RtpsDetector, SnmpDetector, TlsObserveDetector, UdsCanDetector)
 
 
 def pkt(dport, payload, sport=40001, seq=1):
@@ -21,6 +22,121 @@ def pkt(dport, payload, sport=40001, seq=1):
                      b"\n\x00\x00\x01", b"\n\x00\x00\x02")
     tcp = struct.pack(">HHIIBBHHH", sport, dport, seq, 0, (5 << 4), 0x18, 65535, 0, 0)
     return ip + tcp + payload
+
+
+def upkt(dport, payload, sport=40001):
+    ip = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + 8 + len(payload), 0x1234, 0, 64, 17, 0,
+                     b"\n\x00\x00\x01", b"\n\x00\x00\x02")
+    udp = struct.pack(">HHHH", sport, dport, 8 + len(payload), 0)
+    return ip + udp + payload
+
+
+def ccsds(apid, seq=0, payload=b"tm"):
+    first = apid & 0x7FF
+    return struct.pack(">HHH", first, (3 << 14) | (seq & 0x3FFF), len(payload) - 1) + payload
+
+
+def rtps_data(writer_id):
+    header = b"RTPS" + bytes((2, 3)) + b"\x01\x0f" + b"G" * 12
+    body = b"\x00\x00\x00\x00RRRR" + writer_id + b"\x00" * 8
+    return header + bytes([0x15, 0x01]) + len(body).to_bytes(2, "little") + body
+
+
+def ccsds_apid_scan_reasons(count=10):
+    engine = VerdictEngine([CcsdsDetector(mode="observe", ports=[10000], apid_scan_targets=4)])
+    reasons = []
+    for apid in range(count):
+        _, info = engine.verdict(upkt(10000, ccsds(100 + apid, seq=apid)))
+        reasons.extend(info.get("reasons", []))
+    return reasons
+
+
+def rtps_topic_scan_reasons(count=10):
+    engine = VerdictEngine([RtpsDetector(mode="observe", ports=[7400], topic_scan=4)])
+    reasons = []
+    for t in range(count):
+        _, info = engine.verdict(upkt(7400, rtps_data(bytes([0, 0, t, 0x03]))))
+        reasons.extend(info.get("reasons", []))
+    return reasons
+
+
+def uds_can(pdu, arb=0x7DF):
+    return struct.pack(">IB", arb & 0x1FFFFFFF, len(pdu) & 0xFF) + pdu
+
+
+def uds_did_scan_reasons(count=10):
+    engine = VerdictEngine([UdsCanDetector(mode="observe", ports=[6801], read_scan_targets=4)])
+    reasons, seq = [], 1
+    for did in range(count):
+        frame = uds_can(b"\x22" + struct.pack(">H", 0xF000 + did))
+        _, info = engine.verdict(pkt(6801, frame, seq=seq))
+        seq += len(frame)
+        reasons.extend(info.get("reasons", []))
+    return reasons
+
+
+def iec104(ioa, type_id=102, cot=5, ca=1):
+    asdu = bytes([type_id, 0x01]) + struct.pack("<H", cot) + struct.pack("<H", ca) \
+        + (ioa & 0xFFFFFF).to_bytes(3, "little")
+    return bytes([0x68, 4 + len(asdu)]) + b"\x00\x00\x00\x00" + asdu
+
+
+def iec104_ioa_scan_reasons(count=10):
+    engine = VerdictEngine([Iec104Detector(mode="observe", ports=[2404], read_scan_targets=4)])
+    reasons, seq = [], 1
+    for ioa in range(count):
+        frame = iec104(ioa)
+        _, info = engine.verdict(pkt(2404, frame, seq=seq))
+        seq += len(frame)
+        reasons.extend(info.get("reasons", []))
+    return reasons
+
+
+def _ber(tag, val):
+    return bytes([tag, len(val)]) + val
+
+
+def snmp_get(oid_last):
+    oid = _ber(0x06, bytes([0x2B, 6, 1, 2, 1, 1, oid_last & 0x7F]))   # 1.3.6.1.2.1.1.<n>
+    vb = _ber(0x30, oid + _ber(0x05, b""))
+    pdu = _ber(0xA0, _ber(0x02, b"\x01") + _ber(0x02, b"\x00") + _ber(0x02, b"\x00")
+               + _ber(0x30, vb))
+    return _ber(0x30, _ber(0x02, b"\x01") + _ber(0x04, b"public") + pdu)
+
+
+def snmp_oid_scan_reasons(count=10):
+    engine = VerdictEngine([SnmpDetector(mode="observe", ports=[161], read_scan_targets=4)])
+    reasons = []
+    for i in range(count):
+        _, info = engine.verdict(upkt(161, snmp_get(i + 1)))
+        reasons.extend(info.get("reasons", []))
+    return reasons
+
+
+def mav2(seq, msgid, payload):
+    header = bytes([0xFD, len(payload), 0, 0, seq & 0xFF, 1, 1]) + msgid.to_bytes(3, "little")
+    return header + payload + b"\x00\x00"
+
+
+def mav_msgid_novel_reasons():
+    """정상 msgid 집합 학습 후 인젝션(신규 msgid 76) 관찰 이유를 반환."""
+    engine = VerdictEngine([MavlinkDetector(mode="observe", ports=[14550],
+                                            msgid_warmup=6, msgid_rate_limit=1000)])
+    for i in range(12):
+        engine.verdict(upkt(14550, mav2(i % 256, [0, 30, 33][i % 3], b"\x00" * 4)))
+    _, info = engine.verdict(upkt(14550, mav2(200, 76, b"\x00" * 33)))
+    return info.get("reasons", [])
+
+
+def tls_client_hello(sni="finals.svc"):
+    name = sni.encode()
+    server_name = b"\x00" + len(name).to_bytes(2, "big") + name
+    snl = len(server_name).to_bytes(2, "big") + server_name
+    ext = b"\x00\x00" + len(snl).to_bytes(2, "big") + snl
+    exts = len(ext).to_bytes(2, "big") + ext
+    body = b"\x03\x03" + b"\x00" * 32 + b"\x00" + b"\x00\x02\x00\x2f" + b"\x01\x00" + exts
+    hs = b"\x01" + len(body).to_bytes(3, "big") + body
+    return b"\x16\x03\x03" + len(hs).to_bytes(2, "big") + hs
 
 
 def feed(req, dport, order, sport):
@@ -59,7 +175,27 @@ def mbap(pdu, unit=1, tid=1, proto_id=0, length=None):
 # Modbus는 기본 배포에 DEF_MODBUS_PORTS가 비어 있어 load_engine()으로는 검증되지 않는다
 # (MAVLink/CCSDS/RTPS와 동일하게 포트 미확정 상태에서는 의도적으로 비활성).
 # 여기서는 이미지에 클래스가 정상 반영·동작하는지만 별도 엔진으로 확인한다.
-modbus_engine = VerdictEngine([ModbusDetector(mode="enforce", ports=[502])])
+modbus_engine = VerdictEngine([ModbusDetector(mode="enforce", ports=[502], read_scan_targets=4)])
+
+
+def modbus_read(addr):
+    return b"\x03" + addr.to_bytes(2, "big") + b"\x00\x01"   # FC03 read 1 reg @addr
+
+
+def modbus_sweep_reasons(count=10):
+    """한 연결에서 연속 read로 주소 공간을 훑는 스캔을 재생하고 관찰 이유를 반환."""
+    engine = VerdictEngine([ModbusDetector(mode="enforce", ports=[502], read_scan_targets=4)])
+    verdicts, reasons, seq = [], [], 1
+    for addr in range(count):
+        frame = mbap(modbus_read(addr))
+        verdict, info = engine.verdict(pkt(502, frame, seq=seq))
+        seq += len(frame)
+        verdicts.append(verdict)
+        reasons.extend(info.get("reasons", []))
+    return verdicts, reasons
+
+
+_sweep_verdicts, _sweep_reasons = modbus_sweep_reasons()
 
 e = load_engine()
 checks = [
@@ -82,6 +218,32 @@ checks = [
     ("Modbus 쓰기(FC06) 관찰만, DROP 안 함",
      modbus_engine.verdict(pkt(502, mbap(b"\x06\x00\x01\x00\x2a"), sport=41011))[0]
      == VERDICT_ACCEPT),
+    ("Modbus 단일 read 무신호",
+     VerdictEngine([ModbusDetector(mode="observe", ports=[502], read_scan_targets=4)])
+     .verdict(pkt(502, mbap(modbus_read(0)), sport=41012))[1]["reasons"] == []),
+    ("Modbus read 스캔 enforce+포트 차단(flag 유출 방지)",
+     VERDICT_DROP in _sweep_verdicts
+     and any("modbus_read_enumeration" in r for r in _sweep_reasons)),
+    ("Modbus read 스캔 observe는 관찰만(차단 안 함)",
+     (lambda vs: all(v == VERDICT_ACCEPT for v in vs))(
+         [VerdictEngine([ModbusDetector(mode="observe", ports=[502], read_scan_targets=4)])
+          .verdict(pkt(502, mbap(modbus_read(a)), seq=1 + a * 12))[0] for a in range(10)])),
+    ("CCSDS APID 스캔 관찰됨(차단 안 함)",
+     any("ccsds_apid_enumeration" in r for r in ccsds_apid_scan_reasons())),
+    ("RTPS topic 스캔 관찰됨(차단 안 함)",
+     any("rtps_topic_enumeration" in r for r in rtps_topic_scan_reasons())),
+    ("UDS/CAN DID 스캔 관찰됨(차단 안 함)",
+     any("uds_did_enumeration" in r for r in uds_did_scan_reasons())),
+    ("IEC-104 IOA 스캔 관찰됨(차단 안 함)",
+     any("iec104_ioa_enumeration" in r for r in iec104_ioa_scan_reasons())),
+    ("SNMP OID 스캔 관찰됨(차단 안 함)",
+     any("snmp_oid_enumeration" in r for r in snmp_oid_scan_reasons())),
+    ("TLS 채널 관찰됨(SNI 추출, 차단 안 함)",
+     (lambda r: r[0] == VERDICT_ACCEPT and any("tls_channel" in x for x in r[1]["reasons"]))(
+         VerdictEngine([TlsObserveDetector(mode="observe")]).verdict(
+             pkt(8443, tls_client_hello("finals.svc"))))),
+    ("MAVLink msgid 프로파일 밖 인젝션 관찰(차단 안 함)",
+     any("mavlink_msgid_novel" in r for r in mav_msgid_novel_reasons())),
 ]
 
 ok = True
