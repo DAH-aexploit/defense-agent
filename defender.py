@@ -35,8 +35,9 @@ import urllib.request
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from detectors import (CcsdsDetector, Evidence, EvidenceClass, Iec104Detector,
-                       IdentificationBasis, MavlinkDetector, ModbusDetector, PacketContext,
+from detectors import (CcsdsDetector, DnsDetector, Evidence, EvidenceClass, Iec104Detector,
+                       IdentificationBasis, MavlinkDetector, ModbusDetector, MqttDetector,
+                       PacketContext,
                        ParamRangeDetector, RequestBurstDetector, RtpsDetector,
                        SignatureDetector, SnmpDetector, TlsObserveDetector, UdsCanDetector)
 # 리허설 스켈레톤 전용 검사기 — 본선 무관, DAH2026_본선_방산프로토콜_준비.md 참조
@@ -103,6 +104,8 @@ MODBUS_MODE = os.environ.get("DEF_MODBUS_MODE", "enforce").lower()
 UDS_CAN_MODE = os.environ.get("DEF_UDS_CAN_MODE", "enforce").lower()
 IEC104_MODE = os.environ.get("DEF_IEC104_MODE", "enforce").lower()
 SNMP_MODE = os.environ.get("DEF_SNMP_MODE", "enforce").lower()
+MQTT_MODE = os.environ.get("DEF_MQTT_MODE", "enforce").lower()
+DNS_MODE = os.environ.get("DEF_DNS_MODE", "enforce").lower()
 TLS_MODE = os.environ.get("DEF_TLS_MODE", "observe").lower()
 
 # 리허설 스켈레톤 전용 검사기 설정 — 본선 무관, rehearsal_web_detectors.py 참조
@@ -127,6 +130,8 @@ MODBUS_MAX_READ_QTY = _env_number("DEF_MODBUS_MAX_READ_QTY", 0, int, 0)  # 0=비
 UDS_CAN_PORTS = _env_ports("DEF_UDS_CAN_PORTS")
 IEC104_PORTS = _env_ports("DEF_IEC104_PORTS")
 SNMP_PORTS = _env_ports("DEF_SNMP_PORTS")
+MQTT_PORTS = _env_ports("DEF_MQTT_PORTS")
+DNS_PORTS = _env_ports("DEF_DNS_PORTS")
 
 
 def _env_int_list(name: str) -> list[int]:
@@ -767,6 +772,10 @@ def load_engine() -> VerdictEngine:
     if SNMP_MODE != "off":
         extra.append(SnmpDetector(mode=SNMP_MODE, ports=SNMP_PORTS,
                                   max_oids=SNMP_MAX_OIDS))
+    if MQTT_MODE != "off":
+        extra.append(MqttDetector(mode=MQTT_MODE, ports=MQTT_PORTS))
+    if DNS_MODE != "off":
+        extra.append(DnsDetector(mode=DNS_MODE, ports=DNS_PORTS))
     if TLS_MODE != "off":                            # 암호화 채널 관찰(차단 안 함) — 포트 무관
         extra.append(TlsObserveDetector(mode=TLS_MODE))
     # 리허설 스켈레톤 전용 — 본선 무관, DAH2026_본선_방산프로토콜_준비.md 참조
@@ -1132,7 +1141,8 @@ def _log_active_config() -> None:
         ("mavlink", MAVLINK_MODE, MAVLINK_PORTS, True), ("ccsds", CCSDS_MODE, CCSDS_PORTS, True),
         ("rtps", RTPS_MODE, RTPS_PORTS, True), ("modbus", MODBUS_MODE, MODBUS_PORTS, True),
         ("uds_can", UDS_CAN_MODE, UDS_CAN_PORTS, True), ("iec104", IEC104_MODE, IEC104_PORTS, True),
-        ("snmp", SNMP_MODE, SNMP_PORTS, True), ("tls", TLS_MODE, [], False),
+        ("snmp", SNMP_MODE, SNMP_PORTS, True), ("mqtt", MQTT_MODE, MQTT_PORTS, True),
+        ("dns", DNS_MODE, DNS_PORTS, True), ("tls", TLS_MODE, [], False),
     ]
     logging.info("detectors: %s", " ".join(f"{n}={_fmt(m, p, g)}" for n, m, p, g in protos))
     knobs = []

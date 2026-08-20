@@ -1584,3 +1584,180 @@ class TlsObserveDetector(Detector):
         return [self._hit(
             f"tls_channel version={major}.{minor} port={ctx.dport} "
             f"sni={sni or '?'} (payload 기반 detector blind)")]
+
+
+# ── MQTT 관찰기 (UGV 브로커, attacker-finals UGV-MQTT) ──────────────────────────
+# read-only 탈취: SUBSCRIBE(type 8)로 여러 topic을 구독해 flag 담긴 메시지를 읽는다. 여러 topic을
+# 훑는 것이 read 스캔이다. CONNECT/PUBLISH도 파싱하되 topic 열거만 차단 대상으로 둔다. MQTT는
+# magic이 없어(고정헤더 1byte + VBI) port profile을 전제조건으로 둔다(보통 1883/8883).
+class MqttDetector(Detector):
+    """MQTT 3.1.1/5.0 고정헤더·VBI 구조 관찰과 SUBSCRIBE topic 열거"""
+
+    name = "mqtt"
+
+    def __init__(self, mode="observe", ports=None, weight=1.0,
+                 read_window=5.0, read_scan_targets=16, max_keys=4096, now=None) -> None:
+        self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
+        self.ports = {int(p) for p in (ports or [])}
+        self.weight = float(weight)
+        self.read_window = float(read_window)
+        self.read_scan_targets = max(1, int(read_scan_targets))
+        self._now = now or time.monotonic
+        self._reads = BoundedState(max(32, int(max_keys)), max(self.read_window * 2, 1.0), self._now)
+
+    @property
+    def rule_count(self):
+        return 0 if self.mode == "off" else 1
+
+    def _hit(self, reason, rule_id, actionable=True):
+        enabled = self.mode == "enforce" and actionable
+        return Evidence(
+            self.weight if enabled else 0.0, reason, f"mqtt:{rule_id}", rule_id,
+            EvidenceClass.CONTEXT_REQUIRED if enabled else EvidenceClass.OBSERVATION_ONLY,
+            IdentificationBasis.PROFILE_BOUND, bool(self.ports), enabled, True)
+
+    @staticmethod
+    def _vbi(data: bytes, off: int):
+        """MQTT Variable Byte Integer(remaining length). (값, 다음 off) 또는 None(비정규/초과)."""
+        mult, val, i = 1, 0, off
+        for _ in range(4):
+            if i >= len(data):
+                return None
+            b = data[i]
+            val += (b & 0x7F) * mult
+            i += 1
+            if not (b & 0x80):
+                return val, i
+            mult <<= 7
+        return None                                     # 4byte 초과 = 비정규 인코딩
+
+    @staticmethod
+    def _topics(body: bytes, has_qos: bool):
+        """SUBSCRIBE/UNSUBSCRIBE payload에서 length-prefixed topic filter를 뽑는다."""
+        out, i = [], 2                                  # packet identifier(2) 건너뜀
+        while i + 2 <= len(body) and len(out) < 64:
+            ln = int.from_bytes(body[i:i + 2], "big")
+            i += 2
+            if i + ln > len(body):
+                break
+            out.append(bytes(body[i:i + ln]))
+            i += ln + (1 if has_qos else 0)             # SUBSCRIBE는 각 필터 뒤 QoS 1byte
+        return out
+
+    def inspect(self, ctx: PacketContext) -> list[Evidence]:
+        if self.mode == "off" or not self.ports or ctx.proto != 6 or ctx.dport not in self.ports:
+            return []
+        data = ctx.segment_payload or ctx.payload
+        hits, topics, off, count = [], [], 0, 0
+        while off + 2 <= len(data) and count < 32:
+            ptype = data[off] >> 4
+            parsed = self._vbi(data, off + 1)
+            if parsed is None:
+                hits.append(self._hit("mqtt_malformed_vbi", "MQTT-MALFORMED", actionable=False))
+                break
+            rem, body_off = parsed
+            end = body_off + rem
+            if ptype == 0 or ptype > 15 or end > len(data):
+                if end > len(data):
+                    hits.append(self._hit(f"mqtt_length_over_buffer rem={rem}",
+                                          "MQTT-MALFORMED", actionable=False))
+                break
+            if ptype in (8, 10):                        # SUBSCRIBE / UNSUBSCRIBE
+                topics += self._topics(data[body_off:end], has_qos=(ptype == 8))
+            off, count = end, count + 1
+        if topics:
+            distinct = _track_scan(self._reads, _svc_key(ctx), topics, self._now(),
+                                   self.read_window, self.read_scan_targets)
+            if distinct:
+                hits.append(self._hit(f"mqtt_topic_enumeration distinct={distinct}",
+                                      "MQTT-READ-SCAN", actionable=True))
+        return hits
+
+
+# ── DNS 관찰기 (MCS resolver, attacker-finals MCS-DNS) ─────────────────────────
+# read 탈취: 여러 QNAME 조회로 내부 정보·flag 서브도메인을 열거한다. 구조 위반(압축 포인터
+# 루프/과도 depth, 섹션 경계 초과)도 관찰한다. DNS는 magic이 없어 port profile 전제(보통 53).
+class DnsDetector(Detector):
+    """DNS 헤더·question 구조 관찰과 QNAME 열거, 압축 포인터 루프 탐지"""
+
+    name = "dns"
+
+    def __init__(self, mode="observe", ports=None, weight=1.0,
+                 read_window=5.0, read_scan_targets=24, max_keys=4096, now=None) -> None:
+        self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
+        self.ports = {int(p) for p in (ports or [])}
+        self.weight = float(weight)
+        self.read_window = float(read_window)
+        self.read_scan_targets = max(1, int(read_scan_targets))
+        self._now = now or time.monotonic
+        self._reads = BoundedState(max(32, int(max_keys)), max(self.read_window * 2, 1.0), self._now)
+
+    @property
+    def rule_count(self):
+        return 0 if self.mode == "off" else 1
+
+    def _hit(self, reason, rule_id, actionable=True):
+        enabled = self.mode == "enforce" and actionable
+        return Evidence(
+            self.weight if enabled else 0.0, reason, f"dns:{rule_id}", rule_id,
+            EvidenceClass.CONTEXT_REQUIRED if enabled else EvidenceClass.OBSERVATION_ONLY,
+            IdentificationBasis.PROFILE_BOUND, bool(self.ports), enabled, True)
+
+    @staticmethod
+    def _qname(data: bytes, off: int):
+        """QNAME을 읽어 (name_bytes, 다음 off, malformed?) 반환. 압축 포인터 루프/depth 방어."""
+        labels, seen, hops = [], set(), 0
+        i, end_after_ptr = off, None
+        while i < len(data):
+            length = data[i]
+            if length == 0:
+                i += 1
+                break
+            if length & 0xC0 == 0xC0:                   # 압축 포인터(2byte)
+                if i + 1 >= len(data):
+                    return None, i, True
+                ptr = ((length & 0x3F) << 8) | data[i + 1]
+                if ptr in seen or ptr >= len(data) or hops > 16:
+                    return b".".join(labels), i + 2, True   # 루프/과도 depth = malformed
+                seen.add(ptr)
+                hops += 1
+                if end_after_ptr is None:
+                    end_after_ptr = i + 2
+                i = ptr
+                continue
+            if length & 0xC0:                           # 예약 비트 = malformed
+                return b".".join(labels), i + 1, True
+            if i + 1 + length > len(data):
+                return None, i, True
+            labels.append(bytes(data[i + 1:i + 1 + length]))
+            i += 1 + length
+        return b".".join(labels), (end_after_ptr if end_after_ptr is not None else i), False
+
+    def inspect(self, ctx: PacketContext) -> list[Evidence]:
+        if self.mode == "off" or not self.ports or ctx.dport not in self.ports:
+            return []
+        data = ctx.segment_payload or ctx.payload
+        if len(data) < 12:
+            return []
+        qd = int.from_bytes(data[4:6], "big")
+        flags = int.from_bytes(data[2:4], "big")
+        if flags & 0x8000 or qd == 0 or qd > 64:        # 응답(QR=1)·비정상 QDCOUNT는 무시
+            return []
+        hits, names, off = [], [], 12
+        for _ in range(min(qd, 64)):
+            name, nxt, bad = self._qname(data, off)
+            if bad:
+                hits.append(self._hit("dns_malformed_qname (압축 루프/경계)",
+                                      "DNS-MALFORMED", actionable=False))
+                break
+            if name is None or nxt + 4 > len(data):
+                break
+            names.append(name.lower())
+            off = nxt + 4                               # QTYPE(2)+QCLASS(2)
+        if names:
+            distinct = _track_scan(self._reads, _svc_key(ctx), names, self._now(),
+                                   self.read_window, self.read_scan_targets)
+            if distinct:
+                hits.append(self._hit(f"dns_qname_enumeration distinct={distinct}",
+                                      "DNS-READ-SCAN", actionable=True))
+        return hits
