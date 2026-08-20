@@ -123,9 +123,30 @@ def _env_ports(name: str) -> list[int]:
 CCSDS_PORTS = _env_ports("DEF_CCSDS_PORTS")
 RTPS_PORTS = _env_ports("DEF_RTPS_PORTS")
 MODBUS_PORTS = _env_ports("DEF_MODBUS_PORTS")
+MODBUS_MAX_READ_QTY = _env_number("DEF_MODBUS_MAX_READ_QTY", 0, int, 0)  # 0=비활성, 정상 최대 qty로 설정 시 초과 read 차단
 UDS_CAN_PORTS = _env_ports("DEF_UDS_CAN_PORTS")
 IEC104_PORTS = _env_ports("DEF_IEC104_PORTS")
 SNMP_PORTS = _env_ports("DEF_SNMP_PORTS")
+
+
+def _env_int_list(name: str) -> list[int]:
+    """콤마 구분 정수 목록(10진/0x16진 허용). 비면 []=비활성. UDS DID allowlist 등에 사용."""
+    out = []
+    for tok in os.environ.get(name, "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.append(int(tok, 0))
+        except ValueError:
+            logging.warning("invalid entry %r in %s; ignored", tok, name)
+    return out
+
+
+# 단일 read 구분자 knob (전부 기본 OFF, 당일 baseline 확인 후 활성). §7.3 참조.
+UDS_DID_ALLOWLIST = _env_int_list("DEF_UDS_DID_ALLOWLIST")   # 비면 모든 DID 통과
+SNMP_MAX_OIDS = _env_number("DEF_SNMP_MAX_OIDS", 0, int, 0)  # 0=비활성, 요청당 정상 최대 OID 수
+IEC104_IOA_ALLOWLIST = _env_int_list("DEF_IEC104_IOA_ALLOWLIST")  # 비면 모든 IOA C_RD 통과
 
 # 리허설 스켈레톤 전용 — 본선 무관
 URL_GUARD_PORTS = _env_ports("DEF_URL_GUARD_PORTS") or [8082]
@@ -735,13 +756,17 @@ def load_engine() -> VerdictEngine:
     if RTPS_MODE != "off":
         extra.append(RtpsDetector(mode=RTPS_MODE, ports=RTPS_PORTS))
     if MODBUS_MODE != "off":
-        extra.append(ModbusDetector(mode=MODBUS_MODE, ports=MODBUS_PORTS))
+        extra.append(ModbusDetector(mode=MODBUS_MODE, ports=MODBUS_PORTS,
+                                    max_read_qty=MODBUS_MAX_READ_QTY))
     if UDS_CAN_MODE != "off":
-        extra.append(UdsCanDetector(mode=UDS_CAN_MODE, ports=UDS_CAN_PORTS))
+        extra.append(UdsCanDetector(mode=UDS_CAN_MODE, ports=UDS_CAN_PORTS,
+                                    did_allowlist=UDS_DID_ALLOWLIST))
     if IEC104_MODE != "off":
-        extra.append(Iec104Detector(mode=IEC104_MODE, ports=IEC104_PORTS))
+        extra.append(Iec104Detector(mode=IEC104_MODE, ports=IEC104_PORTS,
+                                    ioa_allowlist=IEC104_IOA_ALLOWLIST))
     if SNMP_MODE != "off":
-        extra.append(SnmpDetector(mode=SNMP_MODE, ports=SNMP_PORTS))
+        extra.append(SnmpDetector(mode=SNMP_MODE, ports=SNMP_PORTS,
+                                  max_oids=SNMP_MAX_OIDS))
     if TLS_MODE != "off":                            # 암호화 채널 관찰(차단 안 함) — 포트 무관
         extra.append(TlsObserveDetector(mode=TLS_MODE))
     # 리허설 스켈레톤 전용 — 본선 무관, DAH2026_본선_방산프로토콜_준비.md 참조
@@ -1092,11 +1117,40 @@ def _configure_logging() -> None:
         datefmt="%Y-%m-%d %H:%M:%S", stream=sys.stderr)
 
 
+def _log_active_config() -> None:
+    """방산 detector의 모드·포트·구분자 knob을 기동 로그에 찍는다. `make ship` 후 이 줄로 knob이
+    실제 반영됐는지 판정한다(운영 규칙2: 반영 확인은 기동 로그로만). 포트 미설정 detector는
+    enforce여도 차단하지 않으므로 '(no ports)'로 표시해 착시를 막는다."""
+    def _fmt(mode, ports, gated):
+        if mode == "off":
+            return "off"
+        if not gated:                               # 포트 무관 detector(TLS 관찰)는 포트 없이도 동작
+            return mode
+        return f"{mode}@{','.join(map(str, ports))}" if ports else f"{mode}(no ports=inactive)"
+
+    protos = [
+        ("mavlink", MAVLINK_MODE, MAVLINK_PORTS, True), ("ccsds", CCSDS_MODE, CCSDS_PORTS, True),
+        ("rtps", RTPS_MODE, RTPS_PORTS, True), ("modbus", MODBUS_MODE, MODBUS_PORTS, True),
+        ("uds_can", UDS_CAN_MODE, UDS_CAN_PORTS, True), ("iec104", IEC104_MODE, IEC104_PORTS, True),
+        ("snmp", SNMP_MODE, SNMP_PORTS, True), ("tls", TLS_MODE, [], False),
+    ]
+    logging.info("detectors: %s", " ".join(f"{n}={_fmt(m, p, g)}" for n, m, p, g in protos))
+    knobs = []
+    knobs.append(f"modbus_max_read_qty={MODBUS_MAX_READ_QTY or 'off'}")
+    knobs.append(f"snmp_max_oids={SNMP_MAX_OIDS or 'off'}")
+    knobs.append("uds_did_allowlist=" +
+                 (",".join(f"0x{d:04x}" for d in UDS_DID_ALLOWLIST) if UDS_DID_ALLOWLIST else "off"))
+    knobs.append("iec104_ioa_allowlist=" +
+                 (",".join(map(str, IEC104_IOA_ALLOWLIST)) if IEC104_IOA_ALLOWLIST else "off"))
+    logging.info("distinguisher knobs: %s", " ".join(knobs))
+
+
 def main() -> int:
     _configure_logging()
     engine = load_engine()
     logging.info("engine ready: %d rule(s), threshold=%.2f, budget=%.0fms, bg_analysis=%s",
                  engine.rule_count, engine.drop_threshold, engine.budget_ms, BG_ANALYSIS)
+    _log_active_config()
 
     try:
         sock = dial_seqpacket(AGENT_SOCKET)

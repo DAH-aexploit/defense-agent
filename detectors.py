@@ -844,13 +844,19 @@ class CcsdsDetector(Detector):
         old = self._seq.get(key, None, now)
         if old is not None:
             delta = (packet.sequence_count - old) & 0x3FFF
+            # sequence duplicate/regression은 **observe 전용**(actionable=False). 정상 클라이언트가
+            # 같은 read 요청을 반복하면 sequence_count가 그대로라 duplicate로 보이는데(2026-08-20
+            # bansan 통합 테스트에서 SLA prober의 CCSDS 반복 read를 전부 오탐·차단해 SLA를 깎는
+            # 것을 확인), 정상 재조회와 replay를 sequence만으로는 구분할 수 없다. 강한 replay
+            # 근거는 SDLS counter(아래)뿐이다.
             if delta == 0:
-                confirmed = self._debounce.confirmed((key, "duplicate"), now)
-                hits.append(self._hit(f"ccsds_sequence_duplicate apid={packet.apid}", confirmed))
+                self._debounce.confirmed((key, "duplicate"), now)
+                hits.append(self._hit(f"ccsds_sequence_duplicate apid={packet.apid}", actionable=False))
             elif delta > 0x2000:
-                confirmed = self._debounce.confirmed((key, "regression"), now)
+                self._debounce.confirmed((key, "regression"), now)
                 hits.append(self._hit(
-                    f"ccsds_sequence_regression last={old} current={packet.sequence_count}", confirmed))
+                    f"ccsds_sequence_regression last={old} current={packet.sequence_count}",
+                    actionable=False))
         self._seq.put(key, packet.sequence_count, now)
         # APID 열거: 서비스 단위 + surgical(APID 공간을 확장하는 요청만 근거). 아는 APID
         # telemetry 재수신은 통과. NAT/재접속 대비 서비스(dst,dport) 키.
@@ -1038,10 +1044,15 @@ class ModbusDetector(Detector):
     _MODBUS_ADDR_FCS = frozenset({0x01, 0x02, 0x03, 0x04})
 
     def __init__(self, mode="observe", ports=None, weight=1.0,
-                 read_window=5.0, read_scan_targets=16, max_keys=4096, now=None) -> None:
+                 read_window=5.0, read_scan_targets=16, max_read_qty=0,
+                 max_keys=4096, now=None) -> None:
         self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
         self.ports = {int(p) for p in (ports or [])}
         self.weight = float(weight)
+        # 블록 read 상한: flag가 여러 레지스터에 걸치면 공격자는 큰 블록(qty)을 한 번에 읽어야
+        # 하지만 정상 폴링은 소수만 읽는다(2026-08-20 bansan 통합 테스트: 공격 qty=16 vs 정상 qty=1).
+        # max_read_qty>0이면 그 초과 read 요청을 baseline 위반으로 차단(DEF_MODBUS_MAX_READ_QTY). 0=비활성.
+        self.max_read_qty = max(0, int(max_read_qty))
         # read enumeration 관찰: 정상 폴링은 소수의 고정 레지스터를 반복 조회하지만,
         # attack-agent의 modbus-read-regs(P1)는 flag를 찾으려 주소 공간을 훑는다. 짧은
         # 창 안에서 서로 다른 read 대상이 임계 초과로 관측되면 스캔으로 관찰만 남긴다
@@ -1084,11 +1095,39 @@ class ModbusDetector(Detector):
             if fc not in _MODBUS_READ_FCS:
                 hits.append(self._hit(f"modbus_non_read_function_code 0x{fc:02x}",
                                       "MODBUS-WRITE-FC", actionable=False))
+        # 블록 read 상한 위반 차단: flag가 여러 레지스터에 걸치면 큰 qty를 한 번에 읽어야 한다.
+        # max_read_qty>0(운영자가 정상 최대 qty로 설정)이면 그 초과 read를 baseline 위반으로 차단.
+        if self.max_read_qty:
+            over = self._oversized_read_qty(payload)
+            if over is not None:
+                hits.append(self._hit(
+                    f"modbus_read_qty_over_baseline qty={over}>{self.max_read_qty}",
+                    "MODBUS-READ-QTY", actionable=True))
         # read enumeration(관찰 전용): 재조립 버퍼 안의 연속 MBAP 프레임을 훑어 read 대상을
         # 집계한다. 관찰 전용이라 pipelining 버퍼를 훑어도 차단 위험이 없어, 보수적 단일
         # 프레임 경로가 놓치는 "한 연결에서 연속 read로 주소 공간을 훑는" 실제 스캔을 잡는다.
         hits += self._read_enumeration(ctx, payload)
         return hits
+
+    def _oversized_read_qty(self, payload: bytes):
+        """연속 MBAP 프레임을 훑어 max_read_qty를 초과하는 read qty가 있으면 그 qty를 반환."""
+        off, count = 0, 0
+        while off + 7 <= len(payload) and count < 64:
+            proto_id, length = struct.unpack_from(">HH", payload, off + 2)
+            if proto_id != 0 or length < 2:
+                break
+            frame_end = off + 6 + length
+            if frame_end > len(payload):
+                break
+            pdu = payload[off + 7:frame_end]
+            if pdu:
+                fc = pdu[0] & ~_MODBUS_EXCEPTION_BIT
+                if fc in self._MODBUS_ADDR_FCS and len(pdu) >= 5:   # FC01-04: fc addr(2) qty(2)
+                    qty = int.from_bytes(pdu[3:5], "big")
+                    if qty > self.max_read_qty:
+                        return qty
+            off, count = frame_end, count + 1
+        return None
 
     def _read_targets(self, payload: bytes) -> list[tuple[int, int | None]]:
         """재조립 버퍼의 연속 MBAP 프레임을 훑어 read (fc, addr) 대상을 순서대로 반환.
@@ -1194,12 +1233,15 @@ class UdsCanDetector(Detector):
     name = "uds_can"
 
     def __init__(self, mode="observe", ports=None, weight=1.0,
-                 read_window=5.0, read_scan_targets=16, max_keys=4096, now=None) -> None:
+                 read_window=5.0, read_scan_targets=16, did_allowlist=None, max_keys=4096, now=None) -> None:
         self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
         self.ports = {int(p) for p in (ports or [])}
         self.weight = float(weight)
         self.read_window = float(read_window)
         self.read_scan_targets = max(1, int(read_scan_targets))
+        # 단일 read 구분자(당일 baseline 확인 후 활성). 비어 있으면 OFF(모든 DID 통과). 정상 폴이
+        # 읽는 DID만 넣으면, 목록 밖 DID의 ReadDataByIdentifier(0x22)만 드랍한다. Modbus qty와 대칭.
+        self.did_allowlist = {int(d) for d in (did_allowlist or [])}
         self._now = now or time.monotonic
         self._reads = BoundedState(max(32, int(max_keys)), max(self.read_window * 2, 1.0), self._now)
 
@@ -1237,6 +1279,9 @@ class UdsCanDetector(Detector):
             if sid in _UDS_READ_SIDS:
                 did = int.from_bytes(pdu[1:3], "big") if sid == 0x22 and len(pdu) >= 3 else None
                 read_targets.append((sid, did))
+                if self.did_allowlist and did is not None and did not in self.did_allowlist:
+                    hits.append(self._hit(f"uds_read_did_not_in_allowlist did=0x{did:04x}",
+                                          "UDS-READ-DID", actionable=True))
             elif sid < 0x40:                            # 요청 SID(응답 0x40+/0x7F 제외) 중 비-read
                 hits.append(self._hit(f"uds_non_read_sid 0x{sid:02x}", "UDS-WRITE-SID",
                                       actionable=False))
@@ -1266,12 +1311,16 @@ class Iec104Detector(Detector):
     name = "iec104"
 
     def __init__(self, mode="observe", ports=None, weight=1.0,
-                 read_window=5.0, read_scan_targets=16, max_keys=4096, now=None) -> None:
+                 read_window=5.0, read_scan_targets=16, ioa_allowlist=None, max_keys=4096, now=None) -> None:
         self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
         self.ports = {int(p) for p in (ports or [])}
         self.weight = float(weight)
         self.read_window = float(read_window)
         self.read_scan_targets = max(1, int(read_scan_targets))
+        # 단일 read 구분자(당일 baseline 확인 후 활성). 비면 OFF(모든 IOA 통과). 정상 폴이 읽는
+        # IOA만 넣으면, 목록 밖 IOA의 C_RD(type 102) 타겟 read만 드랍한다. UDS DID allowlist와 대칭.
+        # C_IC(type 100) general interrogation은 IOA가 고정이라 게이팅 대상에서 제외.
+        self.ioa_allowlist = {int(i) for i in (ioa_allowlist or [])}
         self._now = now or time.monotonic
         self._reads = BoundedState(max(32, int(max_keys)), max(self.read_window * 2, 1.0), self._now)
 
@@ -1314,6 +1363,9 @@ class Iec104Detector(Detector):
             ioa = int.from_bytes(asdu[6:9], "little")
             if type_id in _IEC104_READ_TYPES:
                 read_targets.append((type_id, ioa))
+                if self.ioa_allowlist and type_id == 102 and ioa not in self.ioa_allowlist:
+                    hits.append(self._hit(f"iec104_read_ioa_not_in_allowlist ioa={ioa}",
+                                          "IEC104-READ-IOA", actionable=True))
             elif 45 <= type_id <= 69:                   # C_SC/C_DC/C_RC/C_SE 등 제어 명령대
                 hits.append(self._hit(f"iec104_control_command type={type_id}",
                                       "IEC104-CTRL", actionable=False))
@@ -1362,12 +1414,15 @@ class SnmpDetector(Detector):
     name = "snmp"
 
     def __init__(self, mode="observe", ports=None, weight=1.0,
-                 read_window=10.0, read_scan_targets=16, max_keys=4096, now=None) -> None:
+                 read_window=10.0, read_scan_targets=16, max_oids=0, max_keys=4096, now=None) -> None:
         self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
         self.ports = {int(p) for p in (ports or [])}
         self.weight = float(weight)
         self.read_window = float(read_window)
         self.read_scan_targets = max(1, int(read_scan_targets))
+        # 단일 read 구분자(당일 baseline 확인 후 활성). 0 = OFF(개수 무제한). 정상 폴이 OID 1개면
+        # DEF_SNMP_MAX_OIDS=1 로 다중 OID 배치(스윕)만 드랍한다. Modbus max_read_qty와 대칭.
+        self.max_oids = max(0, int(max_oids))
         self._now = now or time.monotonic
         self._reads = BoundedState(max(32, int(max_keys)), max(self.read_window * 2, 1.0), self._now)
 
@@ -1437,12 +1492,17 @@ class SnmpDetector(Detector):
         oids = self._oids(data[pdu[1]:pdu[2]])
         if not oids:
             return []
+        hits = []
+        if self.max_oids and len(oids) > self.max_oids:
+            hits.append(self._hit(
+                f"snmp_read_oids_over_baseline n={len(oids)}>{self.max_oids}",
+                "SNMP-READ-OIDS", actionable=True))
         distinct = _track_scan(self._reads, _svc_key(ctx), oids, self._now(),
                                self.read_window, self.read_scan_targets)
         if distinct:
-            return [self._hit(f"snmp_oid_enumeration distinct={distinct}",
-                              "SNMP-READ-SCAN", actionable=True)]
-        return []
+            hits.append(self._hit(f"snmp_oid_enumeration distinct={distinct}",
+                                  "SNMP-READ-SCAN", actionable=True))
+        return hits
 
 
 def parse_tls_client_hello(data: bytes):

@@ -197,6 +197,26 @@ def modbus_sweep_reasons(count=10):
 
 _sweep_verdicts, _sweep_reasons = modbus_sweep_reasons()
 
+
+# ── 단일 read 구분자 knob 검증 (당일 baseline 후 활성; 이미지 안에서 실제 발동하는지 확인) ──
+def modbus_qty(addr, qty):
+    return b"\x03" + addr.to_bytes(2, "big") + qty.to_bytes(2, "big")   # FC03 read qty regs @addr
+
+
+def snmp_get_multi(n):
+    """한 GetRequest에 OID n개를 배치한 프레임(다중 OID 배치 스윕)."""
+    vbs = b"".join(_ber(0x30, _ber(0x06, bytes([0x2B, 6, 1, 2, 1, 1, i + 1])) + _ber(0x05, b""))
+                   for i in range(n))
+    pdu = _ber(0xA0, _ber(0x02, b"\x01") + _ber(0x02, b"\x00") + _ber(0x02, b"\x00")
+               + _ber(0x30, vbs))
+    return _ber(0x30, _ber(0x02, b"\x01") + _ber(0x04, b"public") + pdu)
+
+
+_mb_qty = VerdictEngine([ModbusDetector(mode="enforce", ports=[502], max_read_qty=1)])
+_snmp_oids = VerdictEngine([SnmpDetector(mode="enforce", ports=[161], max_oids=1)])
+_uds_allow = VerdictEngine([UdsCanDetector(mode="enforce", ports=[6801], did_allowlist=[0xF190])])
+_iec_allow = VerdictEngine([Iec104Detector(mode="enforce", ports=[2404], ioa_allowlist=[100])])
+
 e = load_engine()
 checks = [
     ("L1 순서 뒤섞인 분할 SSRF", VERDICT_DROP in feed(ssrf, 8082, shuffle, 41001)),
@@ -244,6 +264,23 @@ checks = [
              pkt(8443, tls_client_hello("finals.svc"))))),
     ("MAVLink msgid 프로파일 밖 인젝션 관찰(차단 안 함)",
      any("mavlink_msgid_novel" in r for r in mav_msgid_novel_reasons())),
+    # ── 구분자 knob: 공격 read(정상과 다른) 차단 + 정상 단일 read 통과 (쌍으로 확인) ──
+    ("Modbus qty knob: 정상 qty=1 ACCEPT",
+     _mb_qty.verdict(pkt(502, mbap(modbus_qty(0, 1)), sport=41013))[0] == VERDICT_ACCEPT),
+    ("Modbus qty knob: 블록 qty=16 DROP",
+     _mb_qty.verdict(pkt(502, mbap(modbus_qty(0, 16)), sport=41014))[0] == VERDICT_DROP),
+    ("SNMP max_oids knob: 단일 OID ACCEPT",
+     _snmp_oids.verdict(upkt(161, snmp_get(1), sport=41015))[0] == VERDICT_ACCEPT),
+    ("SNMP max_oids knob: 다중 OID 배치 DROP",
+     _snmp_oids.verdict(upkt(161, snmp_get_multi(3), sport=41016))[0] == VERDICT_DROP),
+    ("UDS DID allowlist knob: 허용 DID ACCEPT",
+     _uds_allow.verdict(pkt(6801, uds_can(b"\x22\xf1\x90"), sport=41017))[0] == VERDICT_ACCEPT),
+    ("UDS DID allowlist knob: 목록 밖 DID DROP",
+     _uds_allow.verdict(pkt(6801, uds_can(b"\x22\xde\xad"), sport=41018))[0] == VERDICT_DROP),
+    ("IEC-104 IOA allowlist knob: 허용 IOA C_RD ACCEPT",
+     _iec_allow.verdict(pkt(2404, iec104(100, type_id=102), sport=41019))[0] == VERDICT_ACCEPT),
+    ("IEC-104 IOA allowlist knob: 목록 밖 IOA C_RD DROP",
+     _iec_allow.verdict(pkt(2404, iec104(0xDEAD, type_id=102), sport=41020))[0] == VERDICT_DROP),
 ]
 
 ok = True
