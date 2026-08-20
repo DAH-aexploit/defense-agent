@@ -895,13 +895,18 @@ class TestCcsdsDetector(unittest.TestCase):
         self.assertEqual(verdict, VERDICT_ACCEPT)
         self.assertIn("ccsds_fecf_invalid apid=42", info["reasons"])
 
-    def test_enforce_detects_sequence_replay(self):
+    def test_sequence_duplicate_is_observe_only_never_drops(self):
+        # sequence duplicate는 정상 재조회와 구분 불가라 observe 전용(bansan 통합 테스트에서
+        # SLA prober의 반복 read를 오탐·차단해 SLA를 깎던 것을 관찰만으로 정정).
         e = VerdictEngine([CcsdsDetector(mode="enforce", ports=[10000])])
         pkt = build_udp_packet(10000, _ccsds(seq=9))
-        self.assertEqual(e.verdict(pkt)[0], VERDICT_ACCEPT)
-        # 첫 이상 관찰과 단기 구간 내 두 번째 동일 이상 확정
-        self.assertEqual(e.verdict(pkt)[0], VERDICT_ACCEPT)
-        self.assertEqual(e.verdict(pkt)[0], VERDICT_DROP)
+        info = None
+        for _ in range(5):
+            verdict, info = e.verdict(pkt)
+            self.assertEqual(verdict, VERDICT_ACCEPT)   # 반복 read를 절대 차단하지 않음
+        self.assertTrue(any("ccsds_sequence_duplicate" in r for r in info["reasons"]))
+        evidence = next(i for i in info["evidence"] if i["rule_id"] == "CCSDS-02")
+        self.assertFalse(evidence["drop_eligible"])
 
     def test_enforce_without_port_profile_remains_observation_only(self):
         e = VerdictEngine([CcsdsDetector(mode="enforce")])
@@ -1146,6 +1151,26 @@ class TestModbusDetector(unittest.TestCase):
         self.assertEqual(verdict, VERDICT_ACCEPT)   # observe는 관찰만
         self.assertTrue(any("modbus_read_enumeration" in r for r in info["reasons"]))
 
+    def test_block_read_over_baseline_qty_dropped_small_reads_pass(self):
+        # flag가 여러 레지스터에 걸치면 공격자는 큰 블록(qty)을 읽어야 한다. 정상 최대 qty를
+        # 넘는 read는 차단하고 정상 소량 read는 통과(bansan 통합 테스트: 공격 qty=16 vs 정상 qty=1).
+        det = ModbusDetector(mode="enforce", ports=[502], max_read_qty=1)
+        e = VerdictEngine([det])
+
+        def read(addr, qty, seq):
+            pdu = b"\x03" + addr.to_bytes(2, "big") + qty.to_bytes(2, "big")
+            return e.verdict(build_packet(502, _mbap(pdu), seq=seq))[0]
+        self.assertEqual(read(0, 1, 1), VERDICT_ACCEPT)      # 정상 qty=1 통과
+        self.assertEqual(read(5, 2, 100), VERDICT_DROP)      # qty=2>1 블록 read 차단
+        self.assertEqual(read(9, 16, 200), VERDICT_DROP)     # qty=16 블록 read 차단
+
+    def test_block_read_rule_off_by_default(self):
+        # max_read_qty=0(기본)이면 어떤 qty도 차단하지 않음(오탐 방지, 운영자가 baseline 확인 후 설정)
+        det = ModbusDetector(mode="enforce", ports=[502], max_read_qty=0)
+        e = VerdictEngine([det])
+        pdu = b"\x03\x00\x00\x00\x10"                          # qty=16
+        self.assertEqual(e.verdict(build_packet(502, _mbap(pdu)))[0], VERDICT_ACCEPT)
+
     def test_surgical_known_reads_pass_during_active_scan(self):
         # 프로토콜 통째 차단이 아니라 스캔을 확장하는 요청만 차단: 스캔 진행 중에도 정상
         # 클라이언트가 아는 레지스터를 재조회하는 요청은 통과한다.
@@ -1248,6 +1273,21 @@ class TestUdsCanDetector(unittest.TestCase):
         _, info = e.verdict(build_packet(6801, _uds_can(_uds_rdbi(0xF190))))
         self.assertEqual(info["reasons"], [])
 
+    def test_did_allowlist_blocks_out_of_list_read_allows_listed(self):
+        # 정상 폴이 DID 0xF190만 읽는 baseline → 목록 밖 DID read만 단일 read여도 차단
+        det = UdsCanDetector(mode="enforce", ports=[6801], did_allowlist=[0xF190])
+        e = VerdictEngine([det])
+        v_ok, _ = e.verdict(build_packet(6801, _uds_can(_uds_rdbi(0xF190))))
+        self.assertEqual(v_ok, VERDICT_ACCEPT)      # 허용 DID = 정상 통과
+        v_bad, info = e.verdict(build_packet(6801, _uds_can(_uds_rdbi(0xDEAD)), seq=99))
+        self.assertEqual(v_bad, VERDICT_DROP)       # 목록 밖 DID = 차단
+        self.assertTrue(any(i["rule_id"] == "UDS-READ-DID" for i in info["evidence"]))
+
+    def test_did_allowlist_off_by_default_all_reads_pass(self):
+        e = VerdictEngine([UdsCanDetector(mode="enforce", ports=[6801])])
+        v, _ = e.verdict(build_packet(6801, _uds_can(_uds_rdbi(0xDEAD))))
+        self.assertEqual(v, VERDICT_ACCEPT)         # allowlist 비활성 = 모든 단일 read 통과
+
 
 class TestIec104Detector(unittest.TestCase):
     """IEC 60870-5-104 (attack-agent origin/main P2: iec104_read)"""
@@ -1282,6 +1322,28 @@ class TestIec104Detector(unittest.TestCase):
         _, info = e.verdict(build_packet(2404, b"\x00" + _iec104(0)))
         self.assertEqual(info["reasons"], [])
 
+    def test_ioa_allowlist_blocks_out_of_list_crd_allows_listed(self):
+        # 정상 폴이 IOA 100만 C_RD 하는 baseline → 목록 밖 IOA의 C_RD(type 102)만 단일 read여도 차단
+        det = Iec104Detector(mode="enforce", ports=[2404], ioa_allowlist=[100])
+        e = VerdictEngine([det])
+        v_ok, _ = e.verdict(build_packet(2404, _iec104(100, type_id=102)))
+        self.assertEqual(v_ok, VERDICT_ACCEPT)      # 허용 IOA = 정상 통과
+        v_bad, info = e.verdict(build_packet(2404, _iec104(0x64 + 1, type_id=102), seq=99))
+        self.assertEqual(v_bad, VERDICT_DROP)       # 목록 밖 IOA C_RD = 차단
+        self.assertTrue(any(i["rule_id"] == "IEC104-READ-IOA" for i in info["evidence"]))
+
+    def test_ioa_allowlist_ignores_general_interrogation(self):
+        # C_IC(type 100) general interrogation은 IOA 고정이라 allowlist 게이팅 대상 아님
+        det = Iec104Detector(mode="enforce", ports=[2404], ioa_allowlist=[100])
+        e = VerdictEngine([det])
+        v, _ = e.verdict(build_packet(2404, _iec104(999, type_id=100)))
+        self.assertEqual(v, VERDICT_ACCEPT)         # type 100은 IOA 무관 통과
+
+    def test_ioa_allowlist_off_by_default_all_crd_pass(self):
+        e = VerdictEngine([Iec104Detector(mode="enforce", ports=[2404])])
+        v, _ = e.verdict(build_packet(2404, _iec104(0xDEAD, type_id=102)))
+        self.assertEqual(v, VERDICT_ACCEPT)         # allowlist 비활성 = 모든 단일 C_RD 통과
+
 
 class TestSnmpDetector(unittest.TestCase):
     """SNMP v2c (attack-agent origin/main P2: snmp_v2c_get)"""
@@ -1312,6 +1374,31 @@ class TestSnmpDetector(unittest.TestCase):
         e = VerdictEngine([SnmpDetector(mode="observe", ports=[161])])
         _, info = e.verdict(build_udp_packet(161, b"not-ber-data"))
         self.assertEqual(info["reasons"], [])
+
+    def test_max_oids_blocks_multi_oid_batch_single_oid_passes(self):
+        # 정상 폴이 요청당 OID 1개인 baseline → 한 요청에 여러 OID를 배치한 스윕만 차단
+        det = SnmpDetector(mode="enforce", ports=[161], max_oids=1)
+        e = VerdictEngine([det])
+        v_ok, _ = e.verdict(build_udp_packet(161, _snmp_get((1, 3, 6, 1, 2, 1, 1, 1))))
+        self.assertEqual(v_ok, VERDICT_ACCEPT)      # OID 1개 = 정상 통과
+        two = _ber(0x30, _ber_oid((1, 3, 6, 1, 2, 1, 1, 1)) + _ber(0x05, b"")) \
+            + _ber(0x30, _ber_oid((1, 3, 6, 1, 2, 1, 1, 2)) + _ber(0x05, b""))
+        pdu = _ber(0xA0, _ber(0x02, b"\x01") + _ber(0x02, b"\x00") + _ber(0x02, b"\x00")
+                   + _ber(0x30, two))
+        frame = _ber(0x30, _ber(0x02, b"\x01") + _ber(0x04, b"public") + pdu)
+        v_bad, info = e.verdict(build_udp_packet(161, frame))
+        self.assertEqual(v_bad, VERDICT_DROP)       # OID 2개 배치 = 차단
+        self.assertTrue(any(i["rule_id"] == "SNMP-READ-OIDS" for i in info["evidence"]))
+
+    def test_max_oids_off_by_default_multi_oid_passes(self):
+        e = VerdictEngine([SnmpDetector(mode="enforce", ports=[161])])
+        two = _ber(0x30, _ber_oid((1, 3, 6, 1, 1)) + _ber(0x05, b"")) \
+            + _ber(0x30, _ber_oid((1, 3, 6, 1, 2)) + _ber(0x05, b""))
+        pdu = _ber(0xA0, _ber(0x02, b"\x01") + _ber(0x02, b"\x00") + _ber(0x02, b"\x00")
+                   + _ber(0x30, two))
+        frame = _ber(0x30, _ber(0x02, b"\x01") + _ber(0x04, b"public") + pdu)
+        v, _ = e.verdict(build_udp_packet(161, frame))
+        self.assertEqual(v, VERDICT_ACCEPT)         # max_oids 비활성 = 배치 통과(단일 read라)
 
 
 def _tls_client_hello(sni="finals.svc"):
