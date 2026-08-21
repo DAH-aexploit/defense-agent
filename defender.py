@@ -35,14 +35,18 @@ import urllib.request
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from detectors import (CcsdsDetector, DnsDetector, Evidence, EvidenceClass, Iec104Detector,
+from detectors import (CcsdsDetector, DnsDetector, Evidence, EvidenceClass,
+                       GrpcDiagGuardDetector, Iec104Detector,
                        IdentificationBasis, MavlinkDetector, ModbusDetector, MqttDetector,
                        PacketContext,
                        ParamRangeDetector, RequestBurstDetector, RtpsDetector,
                        SignatureDetector, SnmpDetector, TlsObserveDetector, UdsCanDetector)
 # 리허설 스켈레톤 전용 검사기 — 본선 무관, DAH2026_본선_방산프로토콜_준비.md 참조
-from rehearsal_web_detectors import (AuthSessionDetector, L3ProductIdDetector,
-                                     McsScriptTraversalDetector, UrlSsrGuardDetector)
+from rehearsal_web_detectors import (AuthSessionDetector, GatewayTraversalDetector,
+                                     GraphqlGuardDetector, L3ProductIdDetector,
+                                     McsScriptTraversalDetector, P4WebExploitGuardDetector,
+                                     RscActionGuardDetector,
+                                     TemplateInjectionGuardDetector, UrlSsrGuardDetector)
 try:
     from protocol_profiles import CCSDS_PROFILE, MAVLINK_PROFILE
 except ImportError:
@@ -107,12 +111,22 @@ SNMP_MODE = os.environ.get("DEF_SNMP_MODE", "enforce").lower()
 MQTT_MODE = os.environ.get("DEF_MQTT_MODE", "enforce").lower()
 DNS_MODE = os.environ.get("DEF_DNS_MODE", "enforce").lower()
 TLS_MODE = os.environ.get("DEF_TLS_MODE", "observe").lower()
+# 본선 L1 gRPC(9000, 평문 h2c) 진단로그 경로 이탈 차단 (P1-R2 승리벡터). 포트 gating.
+GRPC_MODE = os.environ.get("DEF_GRPC_MODE", "enforce").lower()
 
 # 리허설 스켈레톤 전용 검사기 설정 — 본선 무관, rehearsal_web_detectors.py 참조
 URL_GUARD_MODE = os.environ.get("DEF_URL_GUARD_MODE", "enforce").lower()
 AUTH_SESSION_MODE = os.environ.get("DEF_AUTH_SESSION_MODE", "enforce").lower()
 MCS_TRAVERSAL_MODE = os.environ.get("DEF_MCS_TRAVERSAL_MODE", "enforce").lower()
 L3_PRODUCT_MODE = os.environ.get("DEF_L3_PRODUCT_MODE", "enforce").lower()
+# 본선 L1 게이트웨이(HTTP) traversal·LFI 차단 (P1-R1 실측 대응). 포트 gating.
+GATEWAY_TRAVERSAL_MODE = os.environ.get("DEF_GATEWAY_TRAVERSAL_MODE", "enforce").lower()
+# 본선 L2 mission-c2(8082) GraphQL 민감 resolver(missionAudit) 차단 (P2-R3 실측). 포트 gating.
+GRAPHQL_MODE = os.environ.get("DEF_GRAPHQL_MODE", "enforce").lower()
+# 본선 L2(8082) SSTI(템플릿 표현식)·RSC action 코드주입 차단 (P2-R4 실측). 포트 gating.
+TEMPLATE_MODE = os.environ.get("DEF_TEMPLATE_MODE", "enforce").lower()
+RSC_MODE = os.environ.get("DEF_RSC_MODE", "enforce").lower()
+P4_WEB_MODE = os.environ.get("DEF_P4_WEB_MODE", "enforce").lower()
 
 
 def _env_ports(name: str) -> list[int]:
@@ -132,6 +146,10 @@ IEC104_PORTS = _env_ports("DEF_IEC104_PORTS")
 SNMP_PORTS = _env_ports("DEF_SNMP_PORTS")
 MQTT_PORTS = _env_ports("DEF_MQTT_PORTS")
 DNS_PORTS = _env_ports("DEF_DNS_PORTS")
+GRPC_PORTS = _env_ports("DEF_GRPC_PORTS") or [9000]
+# UGV(L4, 8410/8420 등) 선제 관찰 그물 포트. 실제 프로토콜 확정 전 DROP 없이 관찰만 해
+# 라운드 시작 즉시 프로토콜(ROS2/RTPS·MQTT·UDS-CAN·Modbus 등)을 식별한다. enforce 아님.
+UGV_OBSERVE_PORTS = _env_ports("DEF_UGV_OBSERVE_PORTS")
 
 
 def _env_int_list(name: str) -> list[int]:
@@ -155,6 +173,10 @@ IEC104_IOA_ALLOWLIST = _env_int_list("DEF_IEC104_IOA_ALLOWLIST")  # 비면 모�
 
 # 리허설 스켈레톤 전용 — 본선 무관
 URL_GUARD_PORTS = _env_ports("DEF_URL_GUARD_PORTS") or [8082]
+GATEWAY_TRAVERSAL_PORTS = _env_ports("DEF_GATEWAY_TRAVERSAL_PORTS") or [8080]
+GRAPHQL_PORTS = _env_ports("DEF_GRAPHQL_PORTS") or [8082]
+TEMPLATE_PORTS = _env_ports("DEF_TEMPLATE_PORTS") or [8082]
+RSC_PORTS = _env_ports("DEF_RSC_PORTS") or [8082]
 URL_GUARD_INTERNAL_HOSTS = tuple(
     host.strip() for host in
     os.environ.get("DEF_URL_GUARD_INTERNAL_HOSTS", "localhost,helper-box").split(",")
@@ -238,8 +260,17 @@ class TcpStreamWindow:
     그 패킷을 DROP하면 요청이 완성되지 않는다. 재전송 세그먼트는 동일한 재조립
     결과를 만들어 동일하게 DROP되므로 판정이 흔들리지 않는다.
 
-    겹치는 세그먼트는 먼저 도착한 내용을 유지한다. 뒤늦은 덮어쓰기로 탐지 결과를
-    바꾸는 회피를 막기 위한 결정이다.
+    겹치는 세그먼트는 먼저 도착한 내용을 유지한다(overlap 정책=first-seen, 문서화됨).
+    뒤늦은 덮어쓰기로 탐지 결과를 바꾸는 회피를 막기 위한 결정이다. 재전송은 동일한
+    재조립 결과를 만들어 중복 삽입되지 않고 동일 판정을 유지한다.
+
+    connection lifecycle: 같은 5-tuple이 재사용될 수 있으므로 SYN을 새 connection
+    generation의 시작으로 보고 이전 재조립 상태를 즉시 폐기한다(source-port 재사용으로
+    이전 HTTP body가 새 요청과 합쳐지는 것을 막는다). FIN/RST 뒤의 상태는 TTL 안에서
+    제거된다 — FIN/RST 즉시 폐기는 하지 않는다: 완성 세그먼트를 DROP한 뒤 teardown 후
+    재전송된 동일 세그먼트가 폐기된 상태에서 단독 ACCEPT되어 서버에서 요청이 완성되는
+    우회를 막기 위한 결정이다. 다음 generation은 SYN으로 시작하므로 즉시 초기화된다.
+    seq 비교는 32-bit wraparound 안전(마스킹 산술).
 
     TTL·cap·flow 수·세그먼트 수 상한으로 메모리를 제한하며, 상한을 벗어나면
     현재 세그먼트를 기준으로 재조립을 다시 시작한다.
@@ -283,7 +314,12 @@ class TcpStreamWindow:
         buf.assembled = bytearray()
         buf.base = (buf.base - back) & 0xFFFFFFFF
 
-    def add(self, flow, seq, payload: bytes) -> bytes:
+    def add(self, flow, seq, payload: bytes, flags: int = 0) -> bytes:
+        # SYN(0x02) = 새 connection generation. 같은 5-tuple 재사용 시 이전 재조립 상태를
+        # 즉시 폐기해 stale body가 새 요청과 합쳐지지 않게 한다. SYN 세그먼트는 보통 payload가
+        # 없어 아래 early-return으로 빠지지만, 상태 초기화는 그 전에 수행한다.
+        if flags & 0x02:
+            self._flows.pop(flow, None)
         if not self.cap or not flow or seq is None or not payload:
             return payload
         now = self._now()
@@ -622,7 +658,8 @@ class VerdictEngine:
             base_ctx = parsed.context
             proto, dport, payload = base_ctx.proto, base_ctx.dport, base_ctx.payload
             info["dport"], info["proto"] = dport, proto
-            inspect_payload = (self.streams.add(base_ctx.flow, base_ctx.transport_seq, payload)
+            inspect_payload = (self.streams.add(base_ctx.flow, base_ctx.transport_seq, payload,
+                                                 base_ctx.transport_flags)
                                if proto == _TCP else payload)
             ctx = PacketContext(proto, dport, inspect_payload, self.payload_cap,
                                 flow=base_ctx.flow, ip_version=base_ctx.ip_version,
@@ -732,8 +769,16 @@ def load_engine() -> VerdictEngine:
         import signatures
         signatures_module = signatures
         sigs = getattr(signatures, "SIGNATURES", []) or []
+        # 특정 rule_id를 enforce에서 제외(observe 다운그레이드)한다. 실측 SLA 오탐이 확인된
+        # 룰(예: UAV-MQTT-001은 모든 정상 MQTT CONNECT를 매치·DROP)을 signatures.py 수정 없이
+        # 즉시·가역적으로 끄기 위한 안전장치. DEF_MQTT_MODE=observe 롤백과 동일 목적, rule 단위.
+        _observe_ids = {s.strip() for s in os.environ.get("DEF_OBSERVE_RULE_IDS", "").split(",")
+                        if s.strip()}
         sigs = [rule for rule in sigs
-                if str(rule.get("id") or rule.get("rule_id")) != "MCS-AUTH-REHEARSAL-001"]
+                if str(rule.get("id") or rule.get("rule_id")) != "MCS-AUTH-REHEARSAL-001"
+                and str(rule.get("id") or rule.get("rule_id")) not in _observe_ids]
+        if _observe_ids:
+            logging.info("rule observe-downgrade (SLA safeguard): %s", sorted(_observe_ids))
         wl = getattr(signatures, "WHITELIST", []) or []
         param_rules = getattr(signatures, "PARAM_RANGES", None)
         if param_rules:
@@ -743,6 +788,16 @@ def load_engine() -> VerdictEngine:
             extra.append(RequestBurstDetector(**rate_cfg))
     except Exception as e:                       # noqa: BLE001 - 룰 없으면 ACCEPT-all로 안전 기동
         logging.warning("signatures import failed (%s) — ACCEPT-all", e)
+    # UGV 선제 관찰 그물: 실제 프로토콜 확정 전 8410/8420 등을 DROP 없이 관찰(observe)만 해
+    # 라운드 시작 즉시 어떤 프로토콜이 매칭되는지(RTPS/ROS2·MQTT·UDS-CAN·Modbus) 신호를 남긴다.
+    # 확정되면 해당 detector를 enforce로 올린다. blind enforce 아님 → SLA 위험 0.
+    if UGV_OBSERVE_PORTS:
+        extra.append(RtpsDetector(mode="observe", ports=UGV_OBSERVE_PORTS))
+        extra.append(MqttDetector(mode="observe", ports=UGV_OBSERVE_PORTS, broad_enforce=False))
+        extra.append(UdsCanDetector(mode="observe", ports=UGV_OBSERVE_PORTS))
+        extra.append(ModbusDetector(mode="observe", ports=UGV_OBSERVE_PORTS))
+        logging.info("UGV observe-net active: ports=%s protos=[rtps,mqtt,uds_can,modbus] (observe, no drop)",
+                     UGV_OBSERVE_PORTS)
     # 프로토콜 미확정 단계의 내장 상태형 관찰기, 기본 observe(weight=0)로 DROP 제외
     if MAVLINK_MODE != "off":
         extra.append(MavlinkDetector(mode=MAVLINK_MODE, ports=MAVLINK_PORTS,
@@ -778,6 +833,8 @@ def load_engine() -> VerdictEngine:
         extra.append(DnsDetector(mode=DNS_MODE, ports=DNS_PORTS))
     if TLS_MODE != "off":                            # 암호화 채널 관찰(차단 안 함) — 포트 무관
         extra.append(TlsObserveDetector(mode=TLS_MODE))
+    if GRPC_MODE != "off":                           # 본선 L1 gRPC(9000) 진단로그 경로 이탈 차단
+        extra.append(GrpcDiagGuardDetector(mode=GRPC_MODE, ports=GRPC_PORTS))
     # 리허설 스켈레톤 전용 — 본선 무관, DAH2026_본선_방산프로토콜_준비.md 참조
     if URL_GUARD_MODE != "off":
         extra.append(UrlSsrGuardDetector(
@@ -790,6 +847,17 @@ def load_engine() -> VerdictEngine:
         extra.append(McsScriptTraversalDetector(mode=MCS_TRAVERSAL_MODE))
     if L3_PRODUCT_MODE != "off":
         extra.append(L3ProductIdDetector(mode=L3_PRODUCT_MODE))
+    if GATEWAY_TRAVERSAL_MODE != "off":
+        extra.append(GatewayTraversalDetector(
+            ports=GATEWAY_TRAVERSAL_PORTS, mode=GATEWAY_TRAVERSAL_MODE))
+    if GRAPHQL_MODE != "off":
+        extra.append(GraphqlGuardDetector(ports=GRAPHQL_PORTS, mode=GRAPHQL_MODE))
+    if TEMPLATE_MODE != "off":
+        extra.append(TemplateInjectionGuardDetector(ports=TEMPLATE_PORTS, mode=TEMPLATE_MODE))
+    if RSC_MODE != "off":
+        extra.append(RscActionGuardDetector(ports=RSC_PORTS, mode=RSC_MODE))
+    if P4_WEB_MODE != "off":
+        extra.append(P4WebExploitGuardDetector(ports=(8082, 9090, 8410, 8420), mode=P4_WEB_MODE))
     engine = VerdictEngine.from_config(sigs, wl, extra_detectors=extra)
     if signatures_module is not None:
         _log_rule_coverage(
@@ -813,6 +881,7 @@ class BackgroundAnalyst:
     def __init__(self, maxsize: int = 256, now=None) -> None:
         self.q: queue.Queue = queue.Queue(maxsize=maxsize)
         self._seen: dict[str, None] = {}
+        self._offered: dict[str, None] = {}
         self._stop = threading.Event()
         self._now = now or time.monotonic
         self._minute_calls = collections.deque()
@@ -823,6 +892,12 @@ class BackgroundAnalyst:
         # verdict 스레드에서 호출 — 절대 블로킹/예외 금지
         try:
             item = dict(observation)
+            key = f"{item.get('proto')}:{item.get('dport')}:{item.get('sample_hex', '')[:80]}"
+            if key in self._offered:
+                return
+            self._offered[key] = None
+            if len(self._offered) > 4096:
+                self._offered.pop(next(iter(self._offered)))
             item["_queued_at"] = self._now()
             self.q.put_nowait(item)
         except queue.Full:
@@ -1142,7 +1217,10 @@ def _log_active_config() -> None:
         ("rtps", RTPS_MODE, RTPS_PORTS, True), ("modbus", MODBUS_MODE, MODBUS_PORTS, True),
         ("uds_can", UDS_CAN_MODE, UDS_CAN_PORTS, True), ("iec104", IEC104_MODE, IEC104_PORTS, True),
         ("snmp", SNMP_MODE, SNMP_PORTS, True), ("mqtt", MQTT_MODE, MQTT_PORTS, True),
-        ("dns", DNS_MODE, DNS_PORTS, True), ("tls", TLS_MODE, [], False),
+        ("dns", DNS_MODE, DNS_PORTS, True), ("grpc", GRPC_MODE, GRPC_PORTS, True),
+        ("graphql", GRAPHQL_MODE, GRAPHQL_PORTS, True),
+        ("template", TEMPLATE_MODE, TEMPLATE_PORTS, True), ("rsc", RSC_MODE, RSC_PORTS, True),
+        ("tls", TLS_MODE, [], False),
     ]
     logging.info("detectors: %s", " ".join(f"{n}={_fmt(m, p, g)}" for n, m, p, g in protos))
     knobs = []

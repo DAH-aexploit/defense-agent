@@ -18,6 +18,12 @@ HISTORY := qa-results/deploy-history.tsv
 qa:
 	python3 tools/qa_gate.py
 
+# 공격 성공 → 방어 커버리지 검증(오프라인·verdict 무영향). actual 성공 framing fixture가
+# ACCEPT면 비정상 종료. competition push 전 수동 실행용(자동 push/deploy 없음).
+#   make attack-coverage ROUND_SOURCE=~/Downloads/DAH-본선
+attack-coverage:
+	python3 tools/attack_coverage.py "$(ROUND_SOURCE)" --gate
+
 test:
 	python3 -m unittest discover -s tests -v
 
