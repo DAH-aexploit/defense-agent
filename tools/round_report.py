@@ -18,9 +18,26 @@ import collections
 import datetime as dt
 import gzip
 import json
+import os
 import re
 import sys
 from pathlib import Path
+
+# 오프라인 replay도 배포 Dockerfile의 detector/port profile과 같아야 한다. 그렇지
+# 않으면 8080 SSRF·1883 MQTT·9000 gRPC를 로컬에서는 비활성으로 재생해 가짜 우회를
+# 만든다. 명시된 호출자 환경은 존중한다.
+_DEPLOYMENT_DEFAULTS = {
+    "DEF_MQTT_PORTS": "8082,1883",
+    "DEF_MQTT_BROAD_ENFORCE": "1",
+    "DEF_URL_GUARD_PORTS": "8082,8080,9000",
+    "DEF_GRPC_PORTS": "9000",
+    "DEF_GATEWAY_TRAVERSAL_PORTS": "8080,8082,8410,8420",
+    "DEF_GRAPHQL_PORTS": "8082",
+    "DEF_P4_WEB_MODE": "enforce",
+    "DEF_OBSERVE_RULE_IDS": "UAV-MQTT-001",
+}
+for _name, _value in _DEPLOYMENT_DEFAULTS.items():
+    os.environ.setdefault(_name, _value)
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -28,6 +45,8 @@ if str(ROOT) not in sys.path:
 
 from defender import VERDICT_DROP, VerdictEngine, load_engine   # noqa: E402
 from tools.pcap_analyze import read_pcap                        # noqa: E402
+from tools.tcp_correlate import (correlate, fingerprint as safe_fingerprint,
+                                 parse_tcp, split_http_transactions)           # noqa: E402
 
 FLAG_RE = re.compile(rb"FLAG\{[^}]{0,120}\}")
 ROUND_RE = re.compile(r"^(?P<round>.+?)-(?:attacker|defender)\.log\.gz$")
@@ -183,34 +202,119 @@ def bypass_sample(data: bytes) -> str:
     Modbus/RTPS)은 프로토콜 지문 + hex dump를 반환한다. 첫 줄을 그대로 latin-1로
     디코드하던 기존 방식은 바이너리에서 깨진 문자만 남아 본선 트래픽 분석에 쓸 수 없었다.
     """
-    if _printable_ratio(data[:180]) >= 0.85:
+    # 출력 가능한 바이트 비율만으로 text를 고르면 MQTT CONNECT의 username/password나
+    # opaque token이 그대로 노출된다. 검증된 HTTP/RTSP request/status line만 text로 표시한다.
+    first = data.split(b"\r\n", 1)[0][:180]
+    if re.match(rb"(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\S+\s+HTTP/1\.[01]$", first):
         return data.split(b"\r\n", 1)[0][:180].decode("latin-1", "ignore")
     proto = _fingerprint(data)
-    label = f"[{proto}] " if proto else "[binary] "
-    return label + _hexdump(data)
+    label = proto or "binary"
+    # MQTT CONNECT에는 client id/username/password가, h2 DATA에는 token이 들어갈 수
+    # 있으므로 보고서에 raw hex/ascii를 싣지 않는다. 구조 지문·길이·digest만 남긴다.
+    return f"[{label}] bytes={len(data)} sha256={safe_fingerprint(data)}"
 
 
 # ──────────────────────────────────────────────────────────────────────
 #  PCAP
 # ──────────────────────────────────────────────────────────────────────
-def infer_service_port(events: list) -> int | None:
-    """서비스 진입 포트 추론 — 요청·응답 양방향에 가장 많이 등장하는 포트
+KNOWN_LAYER_PORTS = {
+    "l1": (8080, 9000),
+    "l2": (8082,),
+    "l3": (1883, 8554, 9090),
+    "l4": (8410, 8420),
+}
 
-    본선 포트가 사전에 공개되지 않아도 동작하도록 포트 하드코딩을 피한다.
+
+def infer_service_ports(events: list, layer: str) -> list[int]:
+    """레이어의 모든 service port 추론.
+
+    공개/실측 포트를 우선하되 양방향 패킷이 실제로 존재할 때만 선택한다. 알려지지
+    않은 다음 phase 포트는 다수 inbound와 server response가 모두 있는 경우에만 추가해
+    ephemeral client port를 service로 오인하지 않는다.
     """
-    counter: collections.Counter = collections.Counter()
+    inbound: collections.Counter = collections.Counter()
+    outbound: collections.Counter = collections.Counter()
+    clients: dict[int, set] = collections.defaultdict(set)
     for _ts, ip in events:
-        parsed = VerdictEngine.parse_l4(ip)
-        if not parsed:
+        p = parse_tcp(ip)
+        if p is None:
             continue
-        meta = parsed[3]
-        counter[meta[4]] += 1      # sport
-        counter[meta[5]] += 1      # dport
-    return counter.most_common(1)[0][0] if counter else None
+        _ver, _proto, src, sport, _dst, dport, _seq, _flags, _payload = p
+        inbound[dport] += 1
+        outbound[sport] += 1
+        clients[dport].add((src, sport))
+    known = [p for p in KNOWN_LAYER_PORTS.get(layer, ()) if inbound[p] and outbound[p]]
+    inferred = [p for p, n in inbound.items()
+                if p not in known and n >= 100 and outbound[p] >= 10 and len(clients[p]) >= 3
+                and p in {8080, 8082, 8410, 8420, 8554, 9000, 9090, 1883}]
+    return sorted(set(known + inferred))
 
 
-def analyze_layer(paths: list[Path], engine_factory) -> dict:
-    """레이어 PCAP 재생 — 인바운드 전수 판정과 flag 반환 연결 역추적"""
+def _analyze_service(events: list, port: int, engine_factory) -> dict:
+    """단일 service port를 재생하고 TCP generation 단위로 flag 응답을 귀속."""
+    engine = engine_factory()
+    inbound = dropped = 0
+    rules: collections.Counter = collections.Counter()
+    observations: collections.Counter = collections.Counter()
+    drop_times: dict[tuple, list[float]] = collections.defaultdict(list)
+
+    for ts, ip in events:
+        p = parse_tcp(ip)
+        if p is None:
+            continue
+        _ver, _proto, src, sport, dst, dport, _seq, _flags, _payload = p
+        if dport != port:
+            continue
+        verdict, info = engine.verdict(ip)
+        inbound += 1
+        base5 = (src, sport, dst, dport)
+        if verdict == VERDICT_DROP:
+            dropped += 1
+            drop_times[base5].append(ts)
+        for item in info.get("evidence", []):
+            rid = item.get("rule_id")
+            if not rid:
+                continue
+            (rules if item.get("drop_eligible") else observations)[rid] += 1
+
+    successes = [c for c in correlate(events, port) if FLAG_RE.search(c.s2c)]
+    blocked = bypassed = segmented = reordered = 0
+    samples: collections.Counter = collections.Counter()
+    for conn in successes:
+        base5 = (conn.client[0], conn.client[1], conn.server[0], conn.server[1])
+        was_dropped = any(conn.first_ts <= ts <= conn.last_ts + 1.0
+                          for ts in drop_times.get(base5, ()))
+        if was_dropped:
+            blocked += 1
+            continue
+        bypassed += 1
+        if len(conn._c2s) > 1:
+            segmented += 1
+        seqs = list(conn._c2s)
+        if conn._c2s_base is not None and seqs != sorted(
+                seqs, key=lambda seq: (seq - conn._c2s_base) & 0xFFFFFFFF):
+            reordered += 1
+        txns = split_http_transactions(conn.c2s)
+        if txns:
+            for tx in txns[-3:]:
+                suffix = "" if tx["complete"] else " [불완전]"
+                samples[f'{tx["method"]} {tx["target"]} HTTP/1.x{suffix}'] += 1
+        else:
+            samples[bypass_sample(conn.c2s)] += 1
+
+    return {
+        "available": True, "service_port": port,
+        "inbound_packets": inbound, "replay_drops": dropped,
+        "replay_rules": dict(rules.most_common()),
+        "observations": dict(observations.most_common()),
+        "flag_responses": len(successes), "blocked_connections": blocked,
+        "bypassed_connections": bypassed, "bypass_segmented": segmented,
+        "bypass_reordered": reordered, "bypass_samples": samples.most_common(8),
+    }
+
+
+def analyze_layer(paths: list[Path], engine_factory, layer: str = "") -> dict:
+    """레이어 PCAP 재생 — 모든 service port를 독립 분석."""
     events = []
     for path in paths:
         try:
@@ -220,79 +324,11 @@ def analyze_layer(paths: list[Path], engine_factory) -> dict:
     if not events:
         return {"available": False}
     events.sort(key=lambda x: x[0])
-    port = infer_service_port(events)
-    if port is None:
+    ports = infer_service_ports(events, layer)
+    if not ports:
         return {"available": False}
-
-    engine = engine_factory()
-    conns: dict = collections.defaultdict(list)
-    successes = []
-    inbound = dropped = 0
-    rules: collections.Counter = collections.Counter()
-    observations: collections.Counter = collections.Counter()
-
-    for ts, ip in events:
-        parsed = VerdictEngine.parse_l4(ip)
-        if not parsed:
-            continue
-        _proto, dport, payload, meta = parsed
-        _v, _p, src, dst, sport, dport2 = meta[:6]
-        seq = meta[6]
-        if dport == port:
-            verdict, info = engine.verdict(ip)
-            inbound += 1
-            if verdict == VERDICT_DROP:
-                dropped += 1
-            for item in info.get("evidence", []):
-                rid = item.get("rule_id")
-                if not rid:
-                    continue
-                # DROP 근거는 차단 실적으로, 관찰 전용 근거(enumeration·write 등)는
-                # 별도 신호로 집계한다. observe 모드에서도 공격 탐침이 어떤 flow에서
-                # 일어나는지 운영자가 보고 enforce 전환 판단에 쓸 수 있게 한다.
-                if item.get("drop_eligible"):
-                    rules[rid] += 1
-                else:
-                    observations[rid] += 1
-            if payload:
-                conns[(src, sport)].append((ts, seq, payload, verdict))
-        elif sport == port and payload and FLAG_RE.search(payload):
-            successes.append((ts, (dst, dport2)))
-
-    blocked = bypassed = 0
-    segmented = reordered = 0
-    samples: collections.Counter = collections.Counter()
-    for ts, conn in successes:
-        segs = [s for s in conns.get(conn, []) if s[0] <= ts]
-        if not segs:
-            continue
-        if any(s[3] == VERDICT_DROP for s in segs):
-            blocked += 1
-            continue
-        bypassed += 1
-        if len(segs) > 1:
-            segmented += 1
-        arrival = b"".join(s[2] for s in segs)
-        by_seq = b"".join(s[2] for s in sorted(segs, key=lambda s: s[1]))
-        if arrival != by_seq:
-            reordered += 1
-        samples[f"{bypass_sample(by_seq)}  [세그먼트 {len(segs)}]"] += 1
-
-    return {
-        "available": True,
-        "files": [p.name for p in paths],
-        "service_port": port,
-        "inbound_packets": inbound,
-        "replay_drops": dropped,
-        "replay_rules": dict(rules.most_common()),
-        "observations": dict(observations.most_common()),
-        "flag_responses": len(successes),
-        "blocked_connections": blocked,
-        "bypassed_connections": bypassed,
-        "bypass_segmented": segmented,
-        "bypass_reordered": reordered,
-        "bypass_samples": samples.most_common(8),
-    }
+    return {"available": True, "files": [p.name for p in paths],
+            "services": [_analyze_service(events, p, engine_factory) for p in ports]}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -336,25 +372,30 @@ def render(round_key: str, log: dict, layers: dict) -> str:
         if not d.get("available"):
             out.append(f"| {name} | - | - | - | - | - | - |")
             continue
-        out.append(f"| {name} | {d['service_port']} | {d['inbound_packets']:,} | "
-                   f"{d['replay_drops']:,} | {d['flag_responses']} | "
-                   f"{d['blocked_connections']} | **{d['bypassed_connections']}** |")
+        for service in d["services"]:
+            out.append(f"| {name} | {service['service_port']} | {service['inbound_packets']:,} | "
+                       f"{service['replay_drops']:,} | {service['flag_responses']} | "
+                       f"{service['blocked_connections']} | **{service['bypassed_connections']}** |")
     out.append("")
 
     for name in sorted(layers):
         d = layers[name]
-        if not d.get("available") or not d["bypassed_connections"]:
+        if not d.get("available"):
             continue
-        out += [f"### {name} 우회 {d['bypassed_connections']}건", "",
-                f"- 세그먼트 분할 {d['bypass_segmented']}건 · 순서 뒤섞임 {d['bypass_reordered']}건", ""]
-        if d["bypass_reordered"]:
-            out += ["> 순서 뒤섞임은 TCP 재조립 회피다. seq 정렬 시 완전한 공격 요청이 복원된다.", ""]
-        out += ["```text"]
-        out += [f"{n}회  {line}" for line, n in d["bypass_samples"]]
-        out += ["```", ""]
+        for service in d["services"]:
+            if not service["bypassed_connections"]:
+                continue
+            out += [f"### {name}/{service['service_port']} 우회 {service['bypassed_connections']}건", "",
+                    f"- 세그먼트 분할 {service['bypass_segmented']}건 · "
+                    f"순서 뒤섞임 {service['bypass_reordered']}건", ""]
+            if service["bypass_reordered"]:
+                out += ["> 순서 뒤섞임은 TCP 재조립 회피다. seq 정렬 시 완전한 공격 요청이 복원된다.", ""]
+            out += ["```text"]
+            out += [f"{n}회  {line}" for line, n in service["bypass_samples"]]
+            out += ["```", ""]
 
-    obs_layers = [n for n in sorted(layers)
-                  if layers[n].get("available") and layers[n].get("observations")]
+    obs_layers = [n for n in sorted(layers) if layers[n].get("available") and any(
+        service.get("observations") for service in layers[n]["services"])]
     if obs_layers:
         out += ["## 2-1. 관찰 신호 (차단 안 함 · enforce 전환 판단용)", "",
                 "> observe 모드의 관찰 전용 근거다. 점수·차단에 영향은 없지만, 어떤 flow가",
@@ -362,8 +403,9 @@ def render(round_key: str, log: dict, layers: dict) -> str:
                 "> 전환 여부를 판단한다. 단일 조회는 신호를 남기지 않는다(임계 초과 시에만).", "",
                 "| 레이어 | 관찰 룰 ID | 관측 |", "|---|---|---:|"]
         for name in obs_layers:
-            for rid, n in layers[name]["observations"].items():
-                out.append(f"| {name} | `{rid}` | {n:,} |")
+            for service in layers[name]["services"]:
+                for rid, n in service["observations"].items():
+                    out.append(f"| {name}/{service['service_port']} | `{rid}` | {n:,} |")
         out.append("")
 
     out += ["## 3. 판단 기준", "",
@@ -396,7 +438,7 @@ def main(argv: list[str]) -> int:
 
     bundle = rounds[key]
     log = analyze_log(bundle["defender_log"])
-    layers = {name: analyze_layer(paths, load_engine)
+    layers = {name: analyze_layer(paths, load_engine, name)
               for name, paths in sorted(bundle["pcaps"].items())}
 
     report = render(key, log, layers)

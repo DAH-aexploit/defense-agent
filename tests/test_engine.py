@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -36,8 +37,11 @@ from detectors import (BoundedState, CcsdsDetector, Detector, DnsDetector, Evide
                        parse_ccsds_packet, parse_mavlink_frames,
                        parse_rtps_message)
 # 리허설 스켈레톤 전용 검사기 — 본선 무관, rehearsal_web_detectors.py 참조
-from rehearsal_web_detectors import (AuthSessionDetector, L3ProductIdDetector,
-                                     McsScriptTraversalDetector, UrlSsrGuardDetector)
+from rehearsal_web_detectors import (AuthSessionDetector, GatewayTraversalDetector,
+                                     GraphqlGuardDetector, L3ProductIdDetector,
+                                     McsScriptTraversalDetector, P4WebExploitGuardDetector,
+                                     RscActionGuardDetector,
+                                     TemplateInjectionGuardDetector, UrlSsrGuardDetector)
 from tests.packet_util import (build_ipv6_packet, build_packet, build_udp_packet,
                                http_get, packet_for)
 from tests.rule_fixtures import TEST_SIGNATURES, TEST_WHITELIST
@@ -1779,12 +1783,53 @@ class TestRoundReportBypassSample(unittest.TestCase):
         self.assertEqual(_fingerprint(b"\xfd\x14\x00\x00\x00" + b"\x00" * 30), "MAVLink v2")
         self.assertEqual(_fingerprint(b"RTPS\x02\x03\x01\x0f" + b"\x00" * 16), "RTPS")
 
-    def test_binary_sample_is_hex_not_garbage(self):
+    def test_binary_sample_is_redacted_fingerprint(self):
         from tools.round_report import bypass_sample
         modbus = struct.pack(">HHHB", 1, 0, 6, 1) + b"\x03\x00\x00\x00\x0a"
         sample = bypass_sample(modbus)
         self.assertIn("[Modbus/TCP]", sample)
-        self.assertIn("03 00 00 00 0a", sample)   # hex dump 형태
+        self.assertIn("sha256=", sample)
+        self.assertNotIn("03 00 00 00 0a", sample)
+
+    def test_printable_mqtt_secret_is_not_rendered(self):
+        from tools.round_report import bypass_sample
+        raw = b"\x10\x20\x00\x04MQTT\x04\xc2\x00\x1eusername-password-opaque-token"
+        sample = bypass_sample(raw)
+        self.assertIn("sha256=", sample)
+        self.assertNotIn("opaque-token", sample)
+
+    def test_round_report_deployment_profile_includes_gateway_ssrf(self):
+        """오프라인 replay가 Dockerfile과 달리 8080 SSRF를 비활성화하지 않음."""
+        import subprocess
+        code = """
+from tools.round_report import load_engine
+from tests.packet_util import packet_for
+v, info = load_engine().verdict(packet_for(8080, '/fetch?dest=http%3A%2F%2F127.0.0.1%3A8080%2F'))
+assert v == 1
+assert 'HTTP-SSRF-NON-GLOBAL-IP' in [x['rule_id'] for x in info['evidence']]
+"""
+        result = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_phase4_observe_net_cannot_drop_root_wildcard(self):
+        """프로토콜 확정 전 8410 관찰망은 공격 지문을 남겨도 SLA를 해치지 않음."""
+        import subprocess
+        code = """
+import os
+os.environ['DEF_UGV_OBSERVE_PORTS'] = '8410,8420'
+from defender import load_engine
+from tests.packet_util import build_packet
+body = b'\\x00\\x01\\x00\\x01#\\x00'
+pkt = bytes([0x82, len(body)]) + body
+v, info = load_engine().verdict(build_packet(8410, pkt))
+assert v == 0
+assert any(x['rule_id'] == 'MQTT-BROAD-SUBSCRIBE' and not x['drop_eligible']
+           for x in info['evidence'])
+"""
+        result = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class TestSuricataScan(unittest.TestCase):
@@ -1859,6 +1904,947 @@ class TestBrokerContract(unittest.TestCase):
             stop.set()
             broker.close(); agent.close()
             worker.join(timeout=1); heart.join(timeout=1)
+
+
+def _gql_post(body: str, path: str = "/graphql") -> bytes:
+    """synthetic GraphQL POST 요청(실제 flag/sessionToken 값 미포함)."""
+    return (f"POST {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n{body}").encode()
+
+
+class TestGraphqlGuard(unittest.TestCase):
+    """P2-R3 L2 GraphQL missionAudit 차단·정상통과·분할/재정렬·sessionToken (synthetic 값만 사용)."""
+
+    ATTACK = _gql_post('{"query":"{ missionAudit }"}')
+    NORMAL = _gql_post('{"query":"{ systemStatus { service version } }"}')
+
+    def _engine(self):
+        return VerdictEngine([GraphqlGuardDetector(ports=[8082], mode="enforce")])
+
+    def _one(self, payload, dport=8082):
+        return self._engine().verdict(build_packet(dport, payload))[0]
+
+    def _feed(self, segments, engine=None, sport=40001):
+        e = engine or self._engine()
+        return [e.verdict(build_packet(8082, p, sport=sport, seq=s))[0] for s, p in segments]
+
+    # ── 공격 DROP (spec item 8) ──
+    def test_single_missionaudit_dropped(self):
+        self.assertEqual(self._one(self.ATTACK), VERDICT_DROP)
+
+    def test_session_token_variant_dropped(self):
+        req = _gql_post('{"query":"{ missionAudit }"}', "/graphql?sessionToken=SYNTH_TOKEN")
+        self.assertEqual(self._one(req), VERDICT_DROP)
+
+    def test_alias_dropped(self):
+        self.assertEqual(self._one(_gql_post('{"query":"{ a: missionAudit }"}')), VERDICT_DROP)
+
+    def test_batch_array_dropped(self):
+        req = _gql_post('[{"query":"{ systemStatus }"},{"query":"{ missionAudit }"}]')
+        self.assertEqual(self._one(req), VERDICT_DROP)
+
+    def test_unicode_escape_dropped(self):
+        self.assertEqual(self._one(_gql_post('{"query":"{ missio\\u006eAudit }"}')), VERDICT_DROP)
+
+    def test_split_header_body_dropped(self):
+        self.assertIn(VERDICT_DROP, self._feed(_split(self.ATTACK, 16)))
+
+    def test_split_mid_token_dropped(self):
+        self.assertIn(VERDICT_DROP, self._feed(_split(self.ATTACK, 5)))
+
+    def test_body_before_header_dropped(self):
+        segs = _split(self.ATTACK, 8)
+        self.assertIn(VERDICT_DROP, self._feed(segs[2:] + segs[:2]))
+
+    def test_completing_and_retransmit_dropped(self):
+        segs = _split(self.ATTACK, 8)
+        e = self._engine()
+        self.assertIn(VERDICT_DROP, self._feed(segs[1:] + [segs[0]], engine=e))
+        self.assertEqual(self._feed([segs[0]], engine=e)[-1], VERDICT_DROP)
+
+    # ── 정상 ACCEPT (spec item 9) ──
+    def test_systemstatus_accepted(self):
+        self.assertEqual(self._one(self.NORMAL), VERDICT_ACCEPT)
+
+    def test_session_token_systemstatus_accepted(self):
+        req = _gql_post('{"query":"{ systemStatus }"}', "/graphql?sessionToken=SYNTH")
+        self.assertEqual(self._one(req), VERDICT_ACCEPT)
+
+    def test_get_root_accepted(self):
+        self.assertEqual(self._one(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n"), VERDICT_ACCEPT)
+
+    def test_get_health_accepted(self):
+        self.assertEqual(self._one(b"GET /health HTTP/1.1\r\nHost: t\r\n\r\n"), VERDICT_ACCEPT)
+
+    def test_get_static_asset_accepted(self):
+        self.assertEqual(self._one(b"GET /js/app.js HTTP/1.1\r\nHost: t\r\n\r\n"), VERDICT_ACCEPT)
+
+    def test_empty_post_accepted(self):
+        self.assertEqual(self._one(b"POST /graphql HTTP/1.1\r\nContent-Length: 0\r\n\r\n"), VERDICT_ACCEPT)
+
+    def test_off_port_accepted(self):
+        self.assertEqual(self._one(self.ATTACK, dport=9999), VERDICT_ACCEPT)
+
+    def test_missionaudit_header_only_accepted(self):
+        req = (b"POST /graphql HTTP/1.1\r\nX-Note: missionAudit\r\n"
+               b'Content-Type: application/json\r\n\r\n{"query":"{ systemStatus }"}')
+        self.assertEqual(self._one(req), VERDICT_ACCEPT)
+
+    def test_missionaudit_unrelated_value_accepted(self):
+        req = _gql_post('{"variables":{"n":"missionAudit"},"query":"{ systemStatus }"}')
+        self.assertEqual(self._one(req), VERDICT_ACCEPT)
+
+    def test_missionauditlog_field_accepted(self):
+        self.assertEqual(self._one(_gql_post('{"query":"{ missionAuditLog }"}')), VERDICT_ACCEPT)
+
+    def test_premissionaudit_field_accepted(self):
+        self.assertEqual(self._one(_gql_post('{"query":"{ premissionAudit }"}')), VERDICT_ACCEPT)
+
+    def test_normal_split_reorder_accepted(self):
+        segs = _split(self.NORMAL, 8)
+        self.assertNotIn(VERDICT_DROP, self._feed(segs[2:] + segs[:2]))
+
+    def test_observe_mode_no_drop(self):
+        e = VerdictEngine([GraphqlGuardDetector(ports=[8082], mode="observe")])
+        self.assertEqual(e.verdict(build_packet(8082, self.ATTACK))[0], VERDICT_ACCEPT)
+
+    def test_off_mode_no_evidence(self):
+        e = VerdictEngine([GraphqlGuardDetector(ports=[8082], mode="off")])
+        _, info = e.verdict(build_packet(8082, self.ATTACK))
+        self.assertEqual(info["reasons"], [])
+
+
+class TestMqttHttpCoexist(unittest.TestCase):
+    """8082 HTTP/MQTT 공존 (spec item 12,13): HTTP는 MQTT 오분류 안 함, 진짜 MQTT는 처리."""
+
+    def test_http_get_not_flagged_as_mqtt(self):
+        e = VerdictEngine([MqttDetector(mode="enforce", ports=[8082])])
+        _, info = e.verdict(build_packet(8082, b"GET /flag.json HTTP/1.1\r\nHost: t\r\n\r\n"))
+        self.assertEqual(info["reasons"], [])
+
+    def test_http_post_not_flagged_as_mqtt(self):
+        e = VerdictEngine([MqttDetector(mode="enforce", ports=[8082])])
+        _, info = e.verdict(build_packet(8082, b"POST /api/login HTTP/1.1\r\nContent-Length: 0\r\n\r\n"))
+        self.assertEqual(info["reasons"], [])
+
+    def test_real_mqtt_subscribe_scanned_on_shared_port(self):
+        det = MqttDetector(mode="enforce", ports=[8082], read_scan_targets=4)
+        e = VerdictEngine([det])
+        verdict, seq = None, 1
+        for i in range(10):
+            frame = _mqtt_sub([f"t/{i}".encode()])
+            verdict, _ = e.verdict(build_packet(8082, frame, seq=seq))
+            seq += len(frame)
+        self.assertEqual(verdict, VERDICT_DROP)
+
+    def test_mqtt_read_scan_does_not_mix_independent_clients(self):
+        det = MqttDetector(mode="enforce", ports=[1883], read_scan_targets=4,
+                           broad_enforce=True)
+        e = VerdictEngine([det])
+        for i in range(12):
+            frame = _mqtt_sub([f"uav/client/{i}".encode()])
+            verdict, info = e.verdict(build_packet(1883, frame, sport=42000 + i, seq=1))
+            self.assertEqual(verdict, VERDICT_ACCEPT, info)
+
+    def test_mqtt_read_scan_still_drops_one_flow_enumeration(self):
+        det = MqttDetector(mode="enforce", ports=[1883], read_scan_targets=4,
+                           broad_enforce=True)
+        e = VerdictEngine([det])
+        seq, verdict = 1, VERDICT_ACCEPT
+        for i in range(6):
+            frame = _mqtt_sub([f"uav/private/{i}".encode()])
+            verdict, _ = e.verdict(build_packet(1883, frame, sport=43000, seq=seq))
+            seq += len(frame)
+        self.assertEqual(verdict, VERDICT_DROP)
+
+    def test_graphql_attack_dropped_with_mqtt_detector_present(self):
+        e = VerdictEngine([MqttDetector(mode="enforce", ports=[8082]),
+                           GraphqlGuardDetector(ports=[8082], mode="enforce")])
+        atk = (b"POST /graphql HTTP/1.1\r\nContent-Type: application/json\r\n\r\n"
+               b'{"query":"{ missionAudit }"}')
+        self.assertEqual(e.verdict(build_packet(8082, atk))[0], VERDICT_DROP)
+
+
+class TestProactiveHardening(unittest.TestCase):
+    """선제 방어 (PCAP/룰카탈로그 근거): GraphQL systemConfig 자격증명 resolver + /telemetry/flag route."""
+
+    def _gql(self, raw, dp=8082):
+        e = VerdictEngine([GraphqlGuardDetector(ports=[8082], mode="enforce")])
+        return e.verdict(build_packet(dp, raw))[0]
+
+    def _gw(self, raw, dp=8080):
+        e = VerdictEngine([GatewayTraversalDetector(ports=[8080, 8082], mode="enforce")])
+        return e.verdict(build_packet(dp, raw))[0]
+
+    def test_systemconfig_credential_resolver_dropped(self):
+        self.assertEqual(self._gql(_gql_post('{"query":"{ systemConfig { mqtt password } }"}')), VERDICT_DROP)
+
+    def test_systemstatus_still_accepted(self):
+        self.assertEqual(self._gql(_gql_post('{"query":"{ systemStatus { service version } }"}')), VERDICT_ACCEPT)
+
+    def test_telemetry_flag_route_dropped(self):
+        self.assertEqual(self._gw(b"GET /telemetry/flag HTTP/1.1\r\nHost: t\r\n\r\n"), VERDICT_DROP)
+
+    def test_svc_telemetry_flag_route_dropped(self):
+        self.assertEqual(self._gw(b"GET /svc/telemetry/flag HTTP/1.1\r\nHost: t\r\n\r\n"), VERDICT_DROP)
+
+    def test_telemetry_status_accepted(self):
+        self.assertEqual(self._gw(b"GET /telemetry/status HTTP/1.1\r\nHost: t\r\n\r\n"), VERDICT_ACCEPT)
+
+    def test_gateway_root_accepted(self):
+        self.assertEqual(self._gw(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n"), VERDICT_ACCEPT)
+
+    def test_p4_l4_direct_flag_routes_dropped(self):
+        d = [GatewayTraversalDetector(ports=[8410, 8420], mode="enforce")]
+        for port in (8410, 8420):
+            for path in (b"/flag", b"/api/flag", b"/admin/flag", b"/%66lag",
+                         b"/api/%2566lag"):
+                raw = b"GET " + path + b" HTTP/1.1\r\nHost: t\r\n\r\n"
+                self.assertEqual(VerdictEngine(d).verdict(build_packet(port, raw))[0],
+                                 VERDICT_DROP, (port, path))
+
+    def test_p4_l4_operational_routes_remain_accepted(self):
+        d = [GatewayTraversalDetector(ports=[8410, 8420], mode="enforce")]
+        for port in (8410, 8420):
+            for method, path in ((b"GET", b"/status"), (b"GET", b"/state"),
+                                 (b"GET", b"/telemetry"), (b"POST", b"/control"),
+                                 (b"POST", b"/api/motor")):
+                raw = method + b" " + path + b" HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
+                self.assertEqual(VerdictEngine(d).verdict(build_packet(port, raw))[0],
+                                 VERDICT_ACCEPT, (port, method, path))
+
+
+class TestP2R4Defenses(unittest.TestCase):
+    """P2-R4 신규 방어: GraphQL 다중공백 · SSTI · RSC 코드주입 · flag-route · vulncheck 프로브."""
+
+    def _v(self, dets, raw, dp):
+        return VerdictEngine(dets).verdict(build_packet(dp, raw))[0]
+
+    def _gql(self, line, body):
+        return (line + "\r\nContent-Type: application/json\r\n\r\n" + body).encode()
+
+    # ── GraphQL 다중 공백/HTAB (Task B) ──
+    def test_graphql_multispace_missionaudit_dropped(self):
+        d = [GraphqlGuardDetector(ports=[8082], mode="enforce")]
+        req = self._gql("POST  /graphql  HTTP/1.1", '{"query":"{ missionAudit }"}')
+        self.assertEqual(self._v(d, req, 8082), VERDICT_DROP)
+
+    def test_graphql_htab_missionaudit_dropped(self):
+        d = [GraphqlGuardDetector(ports=[8082], mode="enforce")]
+        req = self._gql("POST\t/graphql\tHTTP/1.1", '{"query":"{ missionAudit }"}')
+        self.assertEqual(self._v(d, req, 8082), VERDICT_DROP)
+
+    def test_graphql_multispace_systemstatus_accepted(self):
+        d = [GraphqlGuardDetector(ports=[8082], mode="enforce")]
+        req = self._gql("POST  /graphql  HTTP/1.1", '{"query":"{ systemStatus { version } }"}')
+        self.assertEqual(self._v(d, req, 8082), VERDICT_ACCEPT)
+
+    # ── Template SSTI (Task D) ──
+    def test_ssti_multi_engine_expressions_dropped(self):
+        d = [TemplateInjectionGuardDetector(ports=[8082], mode="enforce")]
+        for expr in ("<%= 7*7 %>", "${7*7}", "{{7*7}}", "#{7*7}", "${process.env}"):
+            req = ("GET /css/style.css?q=%s HTTP/1.1\r\nHost:t\r\n\r\n"
+                   % urllib.parse.quote(expr)).encode()
+            self.assertEqual(self._v(d, req, 8082), VERDICT_DROP, expr)
+
+    def test_ssti_normal_query_accepted(self):
+        d = [TemplateInjectionGuardDetector(ports=[8082], mode="enforce")]
+        for q in (b"dark", b"search%20term", b"hello", b"%7B%7Buser.name%7D%7D"):  # {{user.name}}=참조만
+            req = b"GET /css/style.css?q=" + q + b" HTTP/1.1\r\nHost:t\r\n\r\n"
+            self.assertEqual(self._v(d, req, 8082), VERDICT_ACCEPT, q)
+
+    # ── RSC action 코드 주입 (Task C) ──
+    def test_rsc_code_primitive_dropped(self):
+        d = [RscActionGuardDetector(ports=[8082], mode="enforce")]
+        ref = base64.b64encode(b"process.env.FLAG").decode()
+        req = ('POST /api/rsc-action HTTP/1.1\r\nContent-Type: application/json\r\n\r\n'
+               '{"ref":"%s","token":"x"}' % ref).encode()
+        self.assertEqual(self._v(d, req, 8082), VERDICT_DROP)
+
+    def test_rsc_constructor_chain_dropped(self):
+        d = [RscActionGuardDetector(ports=[8082], mode="enforce")]
+        ref = base64.b64encode(b"constructor.constructor('return process')()").decode()
+        req = ('POST /api/rsc-action HTTP/1.1\r\nContent-Type: application/json\r\n\r\n'
+               '{"ref":"%s"}' % ref).encode()
+        self.assertEqual(self._v(d, req, 8082), VERDICT_DROP)
+
+    def test_rsc_normal_ref_accepted(self):
+        d = [RscActionGuardDetector(ports=[8082], mode="enforce")]
+        ref = base64.b64encode(b"JSON.stringify({service:'mission-console',ok:true})").decode()
+        req = ('POST /api/rsc-action HTTP/1.1\r\nContent-Type: application/json\r\n\r\n'
+               '{"ref":"%s","token":"abc"}' % ref).encode()
+        self.assertEqual(self._v(d, req, 8082), VERDICT_ACCEPT)
+
+    # ── flag-route 일반화 + vulncheck 프로브 (Task E) ──
+    def test_flag_route_svc_uuid_dropped(self):
+        d = [GatewayTraversalDetector(ports=[8080, 8082], mode="enforce")]
+        self.assertEqual(self._v(d, b"GET /svc/flag-2b3c/ HTTP/1.1\r\nHost:t\r\n\r\n", 8080), VERDICT_DROP)
+
+    def test_flagship_not_flagged(self):
+        d = [GatewayTraversalDetector(ports=[8080, 8082], mode="enforce")]
+        self.assertEqual(self._v(d, b"GET /flagship HTTP/1.1\r\nHost:t\r\n\r\n", 8080), VERDICT_ACCEPT)
+
+    def test_vulncheck_probe_dropped(self):
+        d = [GatewayTraversalDetector(ports=[8080, 8082], mode="enforce")]
+        req = b"GET /portal/feedback?service_id=vulncheck HTTP/1.1\r\nHost:t\r\n\r\n"
+        self.assertEqual(self._v(d, req, 8080), VERDICT_DROP)
+
+    def test_p4_r12_telemetry_feedback_flag_probe_dropped(self):
+        d = [GatewayTraversalDetector(ports=[8080], mode="enforce")]
+        req = b"GET /portal/feedback?service_id=telemetry HTTP/1.1\r\nHost:t\r\n\r\n"
+        self.assertEqual(self._v(d, req, 8080), VERDICT_DROP)
+
+    def test_normal_service_id_accepted(self):
+        d = [GatewayTraversalDetector(ports=[8080, 8082], mode="enforce")]
+        req = b"GET /portal/feedback?service_id=opensat HTTP/1.1\r\nHost:t\r\n\r\n"
+        self.assertEqual(self._v(d, req, 8080), VERDICT_ACCEPT)
+
+    def test_portal_page_accepted_structural_limit(self):
+        # /portal은 정상 페이지(flag가 응답 HTML에 내장) → 인바운드-전용 구조적 한계, 차단 금지
+        d = [GatewayTraversalDetector(ports=[8080, 8082], mode="enforce")]
+        self.assertEqual(self._v(d, b"GET /portal HTTP/1.1\r\nHost:t\r\n\r\n", 8080), VERDICT_ACCEPT)
+
+
+class TestP2R5Defenses(unittest.TestCase):
+    """P2-R5: absolute-form GraphQL 우회 수정 + 우리 gRPC 성공공격 상호방어(SAT-GRPC-DIAG-PATH)."""
+
+    def _gql_v(self, line, body):
+        e = VerdictEngine([GraphqlGuardDetector(ports=[8082], mode="enforce")])
+        raw = (line + "\r\nHost: team9.lig.internal:8082\r\nContent-Type: application/json\r\n\r\n"
+               + body).encode()
+        return e.verdict(build_packet(8082, raw))[0]
+
+    MA = '{"query":"{ missionAudit { lastDeployment { deployedBy } } }"}'
+    SS = '{"query":"{ systemStatus { version } }"}'
+
+    # ── absolute-form (Task A) ──
+    def test_absolute_form_missionaudit_dropped(self):
+        self.assertEqual(self._gql_v("POST http://team9.lig.internal:8082/graphql HTTP/1.1", self.MA), VERDICT_DROP)
+
+    def test_absolute_form_sessiontoken_dropped(self):
+        self.assertEqual(self._gql_v("POST http://team9.lig.internal:8082/graphql?sessionToken=SYNTH HTTP/1.1", self.MA), VERDICT_DROP)
+
+    def test_absolute_form_multispace_dropped(self):
+        self.assertEqual(self._gql_v("POST  http://team9.lig.internal:8082/graphql  HTTP/1.1", self.MA), VERDICT_DROP)
+
+    def test_absolute_form_uppercase_host_dropped(self):
+        self.assertEqual(self._gql_v("POST http://TEAM9.LIG.INTERNAL:8082/graphql HTTP/1.1", self.MA), VERDICT_DROP)
+
+    def test_userinfo_evasion_dropped(self):
+        self.assertEqual(self._gql_v("POST http://user@team9.lig.internal/graphql HTTP/1.1", self.MA), VERDICT_DROP)
+
+    def test_absolute_form_systemstatus_accepted(self):
+        self.assertEqual(self._gql_v("POST http://team9.lig.internal:8082/graphql HTTP/1.1", self.SS), VERDICT_ACCEPT)
+
+    def test_origin_form_missionaudit_still_dropped(self):
+        self.assertEqual(self._gql_v("POST /graphql HTTP/1.1", self.MA), VERDICT_DROP)
+
+    def test_absolute_form_other_path_accepted(self):
+        self.assertEqual(self._gql_v("POST http://team9.lig.internal:8082/api/x HTTP/1.1", self.MA), VERDICT_ACCEPT)
+
+    # ── 우리 gRPC 성공공격 상호방어 (Task C, synthetic path) ──
+    def _grpc_v(self, payload):
+        from detectors import GrpcDiagGuardDetector
+        e = VerdictEngine([GrpcDiagGuardDetector(ports=[9000], mode="enforce")])
+        return e.verdict(build_packet(9000, payload))[0]
+
+    @staticmethod
+    def _grpc_pkt(path):  # 성공 framing 유지, path만 synthetic sensitive 값
+        marker = b"\x00content-type\x10application/grpc\x00satdiag.v1.SatDiag/TailDiagnosticLog\x00"
+        pb = b"\x0a" + bytes([len(path)]) + path
+        return marker + pb
+
+    def test_grpc_success_flag_path_dropped(self):
+        self.assertEqual(self._grpc_v(self._grpc_pkt(b"/flag")), VERDICT_DROP)
+
+    def test_grpc_traversal_dropped(self):
+        self.assertEqual(self._grpc_v(self._grpc_pkt(b"../flag")), VERDICT_DROP)
+
+    def test_grpc_command_injection_dropped(self):
+        self.assertEqual(self._grpc_v(self._grpc_pkt(b"telemetry.log;printenv FLAG")), VERDICT_DROP)
+
+    def test_grpc_etc_passwd_dropped(self):
+        self.assertEqual(self._grpc_v(self._grpc_pkt(b"/etc/passwd")), VERDICT_DROP)
+
+    def test_grpc_normal_log_accepted(self):
+        for log in (b"gateway.log", b"telemetry.log", b"routing.log"):
+            self.assertEqual(self._grpc_v(self._grpc_pkt(log)), VERDICT_ACCEPT, log)
+
+
+class TestAttackCoverage(unittest.TestCase):
+    """공격성공→방어 커버리지 도구: 확정 성공 수집 + 실제 framing replay 판정 (synthetic 값만)."""
+
+    _LOG = (
+        '[intel:submit] raw http=200 body={"status":"accepted","correct":true,'
+        '"captured":{"team":10,"layer":1,"flag_env":"LAYER1_CHALL2_FLAG"},"round":5}\n'
+        'CAPTURE victim=team10.lig.internal port=9000 flag=<redacted> status=accepted n_flags=1\n'
+        '[intel:recipe] host=team10.lig.internal port=9000 layer=L1 proto=grpc transport=grpc '
+        'technique=grpc method=/satdiag.v1.SatDiag/TailDiagnosticLog path=- raw_hex=- flag=<redacted>\n')
+
+    def _write(self, text):
+        import os
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".log")
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        return path
+
+    def test_collect_requires_accepted_correct_capture_recipe(self):
+        import os
+        from tools.attack_coverage import collect_successes
+        path = self._write(self._LOG)
+        try:
+            s = collect_successes(Path(path))
+            self.assertEqual(len(s), 1)
+            self.assertEqual((s[0]["proto"], s[0]["port"]), ("grpc", 9000))
+        finally:
+            os.unlink(path)
+
+    def test_no_success_when_not_correct(self):
+        import os
+        from tools.attack_coverage import collect_successes
+        path = self._write('[intel:submit] body={"status":"rejected","correct":false}\n'
+                           'CAPTURE victim=x port=9000 status=accepted\n')
+        try:
+            self.assertEqual(collect_successes(Path(path)), [])
+        finally:
+            os.unlink(path)
+
+    def test_actual_grpc_framing_sensitive_path_dropped(self):
+        from tools.attack_coverage import replay
+        from detectors import GrpcDiagGuardDetector
+        engine = VerdictEngine([GrpcDiagGuardDetector(ports=[9000], mode="enforce")])
+        framing = (b"\x00content-type\x10application/grpc\x00"
+                   b"satdiag.v1.SatDiag/TailDiagnosticLog\x00\x0a\x05/flag")
+        self.assertEqual(replay(engine, framing, 9000), VERDICT_DROP)
+
+    def test_normal_grpc_framing_log_accepted(self):
+        from tools.attack_coverage import replay
+        from detectors import GrpcDiagGuardDetector
+        engine = VerdictEngine([GrpcDiagGuardDetector(ports=[9000], mode="enforce")])
+        framing = (b"\x00content-type\x10application/grpc\x00"
+                   b"satdiag.v1.SatDiag/TailDiagnosticLog\x00\x0a\x0bgateway.log")
+        self.assertNotEqual(replay(engine, framing, 9000), VERDICT_DROP)
+
+
+class TestGraphqlChunked(unittest.TestCase):
+    """P2-R6: HTTP chunked-body GraphQL 우회 차단 + 정상 chunked 통과 (synthetic 값)."""
+
+    def _v(self, raw):
+        e = VerdictEngine([GraphqlGuardDetector(ports=[8082], mode="enforce")])
+        return e.verdict(build_packet(8082, raw))[0]
+
+    @staticmethod
+    def _chunked(body, size=3, te="Transfer-Encoding: chunked"):
+        parts = ""
+        for i in range(0, len(body), size):
+            c = body[i:i + size]
+            parts += "%x\r\n%s\r\n" % (len(c), c)
+        parts += "0\r\n\r\n"
+        return ("POST /graphql HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n"
+                "%s\r\n\r\n%s" % (te, parts)).encode()
+
+    _MA = '{"query":"{ missionAudit }"}'
+    _SS = '{"query":"{ systemStatus { version } }"}'
+
+    def test_chunked_missionaudit_dropped(self):
+        self.assertEqual(self._v(self._chunked(self._MA, 3)), VERDICT_DROP)
+
+    def test_chunked_1byte_token_split_dropped(self):
+        self.assertEqual(self._v(self._chunked(self._MA, 1)), VERDICT_DROP)
+
+    def test_chunk_extension_dropped(self):
+        self.assertEqual(self._v(self._chunked(self._MA, 3).replace(b"\r\n", b"; x=1\r\n", 1)),
+                         VERDICT_DROP)
+
+    def test_transfer_encoding_case_insensitive_dropped(self):
+        self.assertEqual(self._v(self._chunked(self._MA, 3, "transfer-encoding: CHUNKED")),
+                         VERDICT_DROP)
+
+    def test_multi_coding_final_chunked_dropped(self):
+        self.assertEqual(self._v(self._chunked(self._MA, 3, "Transfer-Encoding: gzip, chunked")),
+                         VERDICT_DROP)
+
+    def test_normal_chunked_systemstatus_accepted(self):
+        self.assertEqual(self._v(self._chunked(self._SS, 3)), VERDICT_ACCEPT)
+
+    def test_normal_chunked_plain_json_accepted(self):
+        self.assertEqual(self._v(self._chunked('{"a":"hello world"}', 3)), VERDICT_ACCEPT)
+
+    def test_missionaudit_in_variables_value_accepted(self):
+        body = '{"variables":{"n":"missionAudit"},"query":"{ systemStatus }"}'
+        self.assertEqual(self._v(self._chunked(body, 3)), VERDICT_ACCEPT)
+
+    def test_malformed_chunk_no_exception_accepted(self):
+        raw = b"POST /graphql HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\ngarbage"
+        self.assertEqual(self._v(raw), VERDICT_ACCEPT)
+
+    def test_final_coding_not_chunked_accepted(self):
+        # Transfer-Encoding: chunked, gzip → 최종 coding이 chunked 아님 → dechunk 안 함 → systemStatus면 ACCEPT
+        self.assertEqual(self._v(self._chunked(self._SS, 3, "Transfer-Encoding: chunked, gzip")),
+                         VERDICT_ACCEPT)
+
+    def test_non_chunked_missionaudit_still_dropped(self):
+        raw = (b"POST /graphql HTTP/1.1\r\nContent-Type: application/json\r\n\r\n"
+               + self._MA.encode())
+        self.assertEqual(self._v(raw), VERDICT_DROP)
+
+
+class TestRscChunked(unittest.TestCase):
+    """chunked-body 우회를 RSC 검사기로도 확장(공용 _dechunked_http_body). R+1 대비 (synthetic 값)."""
+
+    def _v(self, raw):
+        e = VerdictEngine([RscActionGuardDetector(ports=[8082], mode="enforce")])
+        return e.verdict(build_packet(8082, raw))[0]
+
+    @staticmethod
+    def _b64(text):
+        import base64
+        return base64.b64encode(text.encode()).decode()
+
+    def _req(self, ref, chunked=True, size=3):
+        body = '{"ref":"%s","token":"t"}' % ref
+        if not chunked:
+            return ("POST /api/rsc-action HTTP/1.1\r\nHost: t\r\nContent-Length: %d\r\n\r\n%s"
+                    % (len(body), body)).encode()
+        parts = ""
+        for i in range(0, len(body), size):
+            c = body[i:i + size]
+            parts += "%x\r\n%s\r\n" % (len(c), c)
+        parts += "0\r\n\r\n"
+        return ("POST /api/rsc-action HTTP/1.1\r\nHost: t\r\n"
+                "Transfer-Encoding: chunked\r\n\r\n%s" % parts).encode()
+
+    _DANGER = None
+    _SAFE = None
+
+    def setUp(self):
+        self._DANGER = self._b64('{"x":"process.env.FLAG_STORE"}')
+        self._SAFE = self._b64('{"service":"mission-console","ok":true}')
+
+    def test_chunked_dangerous_ref_dropped(self):
+        self.assertEqual(self._v(self._req(self._DANGER, chunked=True, size=3)), VERDICT_DROP)
+
+    def test_chunked_1byte_split_dropped(self):
+        self.assertEqual(self._v(self._req(self._DANGER, chunked=True, size=1)), VERDICT_DROP)
+
+    def test_chunked_safe_ref_accepted(self):
+        self.assertEqual(self._v(self._req(self._SAFE, chunked=True, size=3)), VERDICT_ACCEPT)
+
+    def test_non_chunked_dangerous_still_dropped(self):
+        self.assertEqual(self._v(self._req(self._DANGER, chunked=False)), VERDICT_DROP)
+
+    def test_non_chunked_safe_accepted(self):
+        self.assertEqual(self._v(self._req(self._SAFE, chunked=False)), VERDICT_ACCEPT)
+
+
+class TestGraphqlR7Structural(unittest.TestCase):
+    """P3-R7: bounded JSON 구조 파서 — escaped key/resolver·query 문자열 배열·batch·trailing NUL.
+    literal `"query"` regex가 놓친 실측 우회를 닫고, 오탐(변수·무관·유사명)은 통과. (synthetic 값)."""
+
+    # actual_sanitized fixtures — round=TEAM9-P3-R7 layer=L2 port=8082 fixture_kind=actual_sanitized
+    # (요청 body에 flag/token 없음 — flag는 응답측. host/token은 synthetic.)
+    R7_ESC_STRING = b'{"qu\\u0065ry":"{ mission\\u0041udit { lastDeployment { notes } } }"}'  # esc key+resolver, seg=2
+    R7_ESC_ARRAY = b'{"query":["{missionAudit{lastDeployment{notes}}}"],"variables":{}}'      # query-array, seg=4
+    R7_ARRAY_PLAIN = b'{"query":["{ missionAudit }"],"variables":{}}'                          # query-array plain
+    R7_PLAIN_NUL = b'{"query":"{ missionAudit }"}\x00\x00\x00\x00\x00\x00'                     # plain + trailing NUL, seg=16
+
+    def _v(self, body: bytes) -> int:
+        raw = (b"POST /graphql HTTP/1.1\r\nHost: synthetic.internal:8082\r\n"
+               b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+        e = VerdictEngine([GraphqlGuardDetector(ports=[8082], mode="enforce")])
+        return e.verdict(build_packet(8082, raw))[0]
+
+    # ── 필수 테스트 1-3: escaped key / resolver / both ──
+    def test_escaped_key_dropped(self):
+        self.assertEqual(self._v(b'{"qu\\u0065ry":"{ missionAudit }"}'), VERDICT_DROP)
+
+    def test_escaped_resolver_dropped(self):
+        self.assertEqual(self._v(b'{"query":"{ mission\\u0041udit }"}'), VERDICT_DROP)
+
+    def test_both_escaped_dropped(self):
+        self.assertEqual(self._v(b'{"qu\\u0065ry":"{ mission\\u0041udit }"}'), VERDICT_DROP)
+
+    # ── 4-5: query 문자열 배열 ──
+    def test_query_string_array_attack_dropped(self):
+        self.assertEqual(self._v(b'{"query":["{missionAudit{lastDeployment}}"],"variables":{}}'), VERDICT_DROP)
+
+    def test_query_string_array_systemstatus_accepted(self):
+        self.assertEqual(self._v(b'{"query":["{systemStatus{service version}}"],"variables":{}}'), VERDICT_ACCEPT)
+
+    # ── 6: top-level batch array 중 하나가 missionAudit ──
+    def test_batch_array_one_missionaudit_dropped(self):
+        self.assertEqual(self._v(b'[{"query":"{ systemStatus }"},{"query":"{ missionAudit }"}]'), VERDICT_DROP)
+
+    # ── 7-9: 오탐 방지 ──
+    def test_missionaudit_only_in_variables_accepted(self):
+        self.assertEqual(self._v(b'{"variables":{"n":"missionAudit"},"query":"{ systemStatus }"}'), VERDICT_ACCEPT)
+
+    def test_missionaudit_only_in_unrelated_prop_accepted(self):
+        self.assertEqual(self._v(b'{"note":"missionAudit","query":"{ systemStatus }"}'), VERDICT_ACCEPT)
+
+    def test_missionauditlog_premissionaudit_accepted(self):
+        self.assertEqual(self._v(b'{"query":"{ missionAuditLog }"}'), VERDICT_ACCEPT)
+        self.assertEqual(self._v(b'{"query":"{ premissionAudit }"}'), VERDICT_ACCEPT)
+
+    # ── 10: 과대 JSON depth/node/array → bounded·예외 없음 ──
+    def test_excessive_json_bounded_no_exception(self):
+        self.assertEqual(self._v(b'{"a":' * 3000 + b'1' + b'}' * 3000), VERDICT_ACCEPT)   # 과대 nesting
+        self.assertEqual(self._v(b'{"query":"' + b'x' * 300000 + b'"}'), VERDICT_ACCEPT)  # 과대 body
+        # 후보 상한 내 decoy padding 뒤 민감 resolver도 잡힘(현실적 배열 크기)
+        self.assertEqual(self._v(b'{"query":[' + b'"x",' * 100 + b'"{missionAudit}"]}'), VERDICT_DROP)
+        # 상한을 넘기는 병리적 decoy는 bounded(예외 없이 ACCEPT) — 문서화된 한계
+        self.assertEqual(self._v(b'{"query":[' + b'"x",' * 9000 + b'"{missionAudit}"]}'), VERDICT_ACCEPT)
+
+    # ── 11: R6 chunked actual 회귀 ──
+    def test_r6_chunked_missionaudit_still_dropped(self):
+        body = b'{"query":"{ missionAudit }"}'
+        parts = b""
+        for i in range(0, len(body), 3):
+            c = body[i:i + 3]
+            parts += b"%x\r\n%s\r\n" % (len(c), c)
+        raw = (b"POST /graphql HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n"
+               b"Transfer-Encoding: chunked\r\n\r\n" + parts + b"0\r\n\r\n")
+        e = VerdictEngine([GraphqlGuardDetector(ports=[8082], mode="enforce")])
+        self.assertEqual(e.verdict(build_packet(8082, raw))[0], VERDICT_DROP)
+
+    # ── 12-13: R7 actual_sanitized fixtures ──
+    def test_r7_actual_escaped_fixture_dropped(self):
+        self.assertEqual(self._v(self.R7_ESC_STRING), VERDICT_DROP)
+
+    def test_r7_actual_array_fixtures_dropped(self):
+        self.assertEqual(self._v(self.R7_ESC_ARRAY), VERDICT_DROP)
+        self.assertEqual(self._v(self.R7_ARRAY_PLAIN), VERDICT_DROP)
+
+    def test_r7_actual_plain_trailing_nul_dropped(self):
+        # 실측: strict json.loads면 trailing NUL에 걸려 회귀 → raw_decode로 차단 유지
+        self.assertEqual(self._v(self.R7_PLAIN_NUL), VERDICT_DROP)
+
+    # ── 14: paired normal 전부 ACCEPT ──
+    def test_paired_normals_accepted(self):
+        for body in (
+            b'{"qu\\u0065ry":"{ system\\u0053tatus { service version } }"}',
+            b'{"query":["{systemStatus{service version}}"],"variables":{}}',
+            b'{"query":"{ systemStatus { service version } }"}\x00\x00\x00',
+            b'[{"query":"{ systemStatus }"},{"query":"{ systemStatus { version } }"}]',
+        ):
+            self.assertEqual(self._v(body), VERDICT_ACCEPT, body)
+
+    # query 값이 scalar/object면 공격 추정 없이 무증거
+    def test_non_string_query_value_accepted(self):
+        self.assertEqual(self._v(b'{"query":123}'), VERDICT_ACCEPT)
+        self.assertEqual(self._v(b'{"query":{"missionAudit":1}}'), VERDICT_ACCEPT)
+
+    # ── pipelined 여러 transaction 분리(같은 connection keep-alive) ──
+    def _pipeline(self, *reqs: bytes) -> int:
+        raw = b"".join(reqs)
+        e = VerdictEngine([GraphqlGuardDetector(ports=[8082], mode="enforce")])
+        return e.verdict(build_packet(8082, raw))[0]
+
+    def test_pipelined_session_then_missionaudit_dropped(self):
+        session = b"POST /api/session HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
+        body = b'{"query":"{ missionAudit }"}'
+        gql = (b"POST /graphql HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n"
+               b"Content-Length: %d\r\n\r\n%s" % (len(body), body))
+        self.assertEqual(self._pipeline(session, gql), VERDICT_DROP)     # 두 번째 transaction
+
+    def test_pipelined_session_then_systemstatus_accepted(self):
+        session = b"POST /api/session HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
+        body = b'{"query":"{ systemStatus { version } }"}'
+        gql = (b"POST /graphql HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n"
+               b"Content-Length: %d\r\n\r\n%s" % (len(body), body))
+        self.assertEqual(self._pipeline(session, gql), VERDICT_ACCEPT)
+
+    def test_pipelined_graphql_then_login_dropped(self):
+        # 실측 R7 esc_array: {"query":[...]}POST /api/login... — graphql이 먼저, 뒤에 다른 요청
+        body = b'{"query":["{missionAudit{lastDeployment{notes}}}"],"variables":{}}'
+        gql = (b"POST /graphql HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n"
+               b"Content-Length: %d\r\n\r\n%s" % (len(body), body))
+        login = b"POST /api/login HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
+        self.assertEqual(self._pipeline(gql, login), VERDICT_DROP)
+
+    def test_pipelined_attack_first_then_normal_still_dropped(self):
+        body = b'{"query":"{ missionAudit }"}'
+        gql = (b"POST /graphql HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n"
+               b"Content-Length: %d\r\n\r\n%s" % (len(body), body))
+        normal_body = b'{"query":"{ systemStatus }"}'
+        gql2 = (b"POST /graphql HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n%s" % (len(normal_body), normal_body))
+        self.assertEqual(self._pipeline(gql, gql2), VERDICT_DROP)
+
+
+class TestGraphqlR7Segmented(unittest.TestCase):
+    """P3-R7: TCP 2-세그먼트·재정렬 전달에서도 완성 시 DROP(엔진 재조립 경로). (synthetic 값)."""
+
+    def _engine(self):
+        return VerdictEngine([GraphqlGuardDetector(ports=[8082], mode="enforce")])
+
+    def _req(self, body: bytes) -> bytes:
+        return (b"POST /graphql HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body)) + body
+
+    def test_two_segment_inorder_completes_drop(self):
+        e = self._engine()
+        raw = self._req(b'{"query":"{ missionAudit }"}')
+        mid = len(raw) // 2
+        self.assertEqual(e.verdict(build_packet(8082, raw[:mid], sport=6001, seq=1))[0], VERDICT_ACCEPT)
+        self.assertEqual(e.verdict(build_packet(8082, raw[mid:], sport=6001, seq=1 + mid))[0], VERDICT_DROP)
+
+    def test_two_segment_reordered_completes_drop(self):
+        e = self._engine()
+        raw = self._req(b'{"qu\\u0065ry":"{ mission\\u0041udit }"}')
+        mid = len(raw) // 2
+        e.verdict(build_packet(8082, raw[mid:], sport=6002, seq=1 + mid))          # 뒷조각 먼저
+        self.assertEqual(e.verdict(build_packet(8082, raw[:mid], sport=6002, seq=1))[0], VERDICT_DROP)
+
+    def test_source_port_reuse_syn_separates(self):
+        e = self._engine()
+        r1 = self._req(b'{"query":"{ systemStatus }"}')
+        self.assertEqual(e.verdict(build_packet(8082, r1, sport=6004, seq=1))[0], VERDICT_ACCEPT)
+        e.verdict(build_packet(8082, b"", sport=6004, seq=5000, flags=0x02))       # 새 SYN
+        r2 = self._req(b'{"query":"{ missionAudit }"}')
+        self.assertEqual(e.verdict(build_packet(8082, r2, sport=6004, seq=5001))[0], VERDICT_DROP)
+
+
+class TestTcpStreamLifecycle(unittest.TestCase):
+    """P3-R7: 재조립 상태 정확성 — SYN generation reset·재정렬·재전송·overlap(first-seen)."""
+
+    FLOW = (4, 6, b"\x0a\x00\x00\x01", b"\x0a\x00\x00\x02", 5555, 8082)
+
+    def _w(self):
+        return TcpStreamWindow(now=lambda: 0.0)
+
+    def test_reorder_reassembles(self):
+        w = self._w()
+        self.assertEqual(w.add(self.FLOW, 7, b"world"), b"world")          # 앞 구간 미도착
+        self.assertEqual(w.add(self.FLOW, 1, b"hello "), b"hello world")   # 빈 구간 메움 → 전체
+
+    def test_retransmission_no_duplicate(self):
+        w = self._w()
+        w.add(self.FLOW, 1, b"hello ")
+        self.assertEqual(w.add(self.FLOW, 7, b"world"), b"hello world")
+        self.assertEqual(w.add(self.FLOW, 7, b"world"), b"hello world")    # 재전송 → 동일
+
+    def test_overlap_first_seen(self):
+        w = self._w()
+        w.add(self.FLOW, 1, b"AAAA")
+        self.assertEqual(w.add(self.FLOW, 1, b"BBBB"), b"AAAA")            # overlap → first-seen 유지
+
+    def test_syn_resets_generation(self):
+        w = self._w()
+        w.add(self.FLOW, 1, b"AAAA")
+        self.assertEqual(w.add(self.FLOW, 900, b"", flags=0x02), b"")      # SYN(payload 없음) → 상태 폐기
+        self.assertEqual(w.add(self.FLOW, 901, b"CCCC"), b"CCCC")         # 새 gen — 이전과 병합 안 됨
+
+    def test_two_consecutive_syn_no_mix(self):
+        w = self._w()
+        w.add(self.FLOW, 1, b"GET /a ")
+        w.add(self.FLOW, 1000, b"", flags=0x02)                            # SYN2
+        self.assertEqual(w.add(self.FLOW, 1001, b"GET /b "), b"GET /b ")   # gen1 잔여와 안 섞임
+
+    def test_fin_then_reuse_syn_no_mix(self):
+        w = self._w()
+        w.add(self.FLOW, 1, b"AAAA")
+        w.add(self.FLOW, 5, b"", flags=0x01)                               # FIN(즉시 폐기 안 함)
+        w.add(self.FLOW, 2000, b"", flags=0x02)                            # 재사용은 SYN으로 시작 → reset
+        self.assertEqual(w.add(self.FLOW, 2001, b"DDDD"), b"DDDD")         # 이전 body와 안 섞임
+
+    def test_seq_wraparound_safe(self):
+        w = self._w()
+        base = 0xFFFFFFFE
+        self.assertEqual(w.add(self.FLOW, base, b"AB"), b"AB")             # base 근처
+        self.assertEqual(w.add(self.FLOW, (base + 2) & 0xFFFFFFFF, b"CD"), b"ABCD")  # wrap 넘어 연속
+
+
+class TestMqttBroadWildcard(unittest.TestCase):
+    """P3-R8: MQTT exact/shared-global wildcard SUBSCRIBE 즉시 차단(단일 filter여도), scoped·정상은 통과."""
+
+    def _det(self):
+        # broad-# enforce 경로를 명시 검증(운영 기본은 observe·SLA 안전, DEF_MQTT_BROAD_ENFORCE로 전환)
+        return MqttDetector(mode="enforce", ports=[1883], broad_enforce=True)
+
+    def test_broad_default_observe(self):
+        # 기본(broad_enforce=False)에서는 exact #가 관찰만 되고 DROP되지 않는다(SLA 안전)
+        det = MqttDetector(mode="enforce", ports=[1883], broad_enforce=False)
+        ev = det.inspect(PacketContext(proto=6, dport=1883, payload=self._sub(b"#")))
+        self.assertTrue(all(e.weight == 0 for e in ev))
+
+    @staticmethod
+    def _sub(topic: bytes, qos: int = 0) -> bytes:
+        payload = b"\x00\x01" + len(topic).to_bytes(2, "big") + topic + bytes([qos])
+        return bytes([0x82, len(payload)]) + payload
+
+    @staticmethod
+    def _connect() -> bytes:
+        vh = b"\x00\x04MQTT\x04\x02\x00\x3c\x00\x06client"
+        return bytes([0x10, len(vh)]) + vh
+
+    def _v(self, pkt: bytes) -> str:
+        ev = self._det().inspect(PacketContext(proto=6, dport=1883, payload=pkt))
+        return "DROP" if any(e.weight > 0 for e in ev) else "ACCEPT"
+
+    def test_exact_hash_dropped(self):
+        self.assertEqual(self._v(self._sub(b"#")), "DROP")
+
+    def test_root_broad_wildcards_dropped(self):
+        self.assertEqual(self._v(self._sub(b"+/#")), "DROP")
+        self.assertEqual(self._v(self._sub(b"+/+/#")), "DROP")
+
+    def test_shared_global_wildcard_dropped(self):
+        self.assertEqual(self._v(self._sub(b"$share/g/#")), "DROP")
+
+    def test_scoped_wildcard_accepted(self):
+        self.assertEqual(self._v(self._sub(b"uav/telemetry/#")), "ACCEPT")
+        self.assertEqual(self._v(self._sub(b"$share/g/uav/#")), "ACCEPT")
+
+    def test_exact_normal_topic_accepted(self):
+        self.assertEqual(self._v(self._sub(b"uav/node/config")), "ACCEPT")
+
+    def test_connect_accepted(self):
+        self.assertEqual(self._v(self._connect()), "ACCEPT")
+
+    def test_malformed_bounded_no_exception(self):
+        self.assertEqual(self._v(b"\x82\xff\xff\xff\xff\x7f"), "ACCEPT")   # 비정규 VBI → 예외 없이 통과
+
+    def test_reassembled_payload_wins_over_incomplete_segment(self):
+        """실제 R10: multi-packet stream의 #가 현재 segment 경계에 걸려도 탐지."""
+        packet = self._connect() + self._sub(b"uav/node/config") + self._sub(b"#")
+        ctx = PacketContext(proto=6, dport=1883, payload=packet,
+                            segment_payload=packet[-1:])
+        ev = self._det().inspect(ctx)
+        self.assertTrue(any(e.rule_id == "MQTT-BROAD-SUBSCRIBE" and e.weight > 0 for e in ev))
+
+    def test_mixed_filters_with_root_hash_dropped(self):
+        body = (b"\x00\x01" + b"\x00\x01#\x00"
+                + b"\x00\x0fuav/node/config\x00"
+                + b"\x00\x05uav/#\x00")
+        packet = bytes([0x82, len(body)]) + body
+        self.assertEqual(self._v(packet), "DROP")
+
+
+class TestRscJsonStructural(unittest.TestCase):
+    """P3-R8: RSC ref를 bounded JSON 구조 파싱 — escaped key·base64 embedded whitespace 우회 차단."""
+
+    @staticmethod
+    def _b64(text: str) -> str:
+        import base64
+        return base64.b64encode(text.encode()).decode()
+
+    def _v(self, body: bytes) -> int:
+        raw = b"POST /api/rsc-action HTTP/1.1\r\nHost: t\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body)
+        e = VerdictEngine([RscActionGuardDetector(ports=[8082], mode="enforce")])
+        return e.verdict(build_packet(8082, raw))[0]
+
+    def setUp(self):
+        self.DANGER = self._b64('{"x":"process.env.SENSITIVE_NAME"}')
+        self.SAFE = self._b64('{"service":"mission-console","ok":true}')
+        self.DANGER_NL = self.DANGER[:10] + "\\n" + self.DANGER[10:20] + "\\n" + self.DANGER[20:]
+
+    def test_escaped_ref_key_dropped(self):
+        self.assertEqual(self._v(b'{"r\\u0065f":"%s","to\\u006ben":""}' % self.DANGER.encode()), VERDICT_DROP)
+
+    def test_base64_embedded_newline_dropped(self):
+        self.assertEqual(self._v(b'{"ref":"%s","token":""}' % self.DANGER_NL.encode()), VERDICT_DROP)
+
+    def test_escaped_key_plus_newline_dropped(self):
+        self.assertEqual(self._v(b'{"r\\u0065f":"%s","token":""}' % self.DANGER_NL.encode()), VERDICT_DROP)
+
+    def test_plain_danger_ref_dropped(self):
+        self.assertEqual(self._v(b'{"ref":"%s","token":""}' % self.DANGER.encode()), VERDICT_DROP)
+
+    def test_normal_ref_accepted(self):
+        self.assertEqual(self._v(b'{"ref":"%s","token":""}' % self.SAFE.encode()), VERDICT_ACCEPT)
+
+    def test_normal_escaped_ref_accepted(self):
+        self.assertEqual(self._v(b'{"r\\u0065f":"%s","token":""}' % self.SAFE.encode()), VERDICT_ACCEPT)
+
+    def test_ref_non_string_accepted(self):
+        self.assertEqual(self._v(b'{"ref":{"missionAudit":1}}'), VERDICT_ACCEPT)
+        self.assertEqual(self._v(b'{"ref":123}'), VERDICT_ACCEPT)
+
+    def test_pipelined_uplink_then_rsc_attack_dropped(self):
+        uplink = b"GET /uplink HTTP/1.1\r\nHost: t\r\n\r\n"
+        body = b'{"ref":"%s","token":""}' % self.DANGER.encode()
+        rsc = (b"POST /api/rsc-action HTTP/1.1\r\nHost: t\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+        e = VerdictEngine([RscActionGuardDetector(ports=[8082], mode="enforce")])
+        self.assertEqual(e.verdict(build_packet(8082, uplink + rsc))[0], VERDICT_DROP)
+
+
+class TestP4WebExploitGuard(unittest.TestCase):
+    def _v(self, raw, port):
+        return VerdictEngine([P4WebExploitGuardDetector()]).verdict(build_packet(port, raw))[0]
+
+    def test_djvu_system_expression_dropped(self):
+        raw = (b"POST /api/imagery/ingest?source=field-console HTTP/1.1\r\n"
+               b"Content-Type: image/vnd.djvu\r\n\r\nDJVU${system(encoded-command)}")
+        self.assertEqual(self._v(raw, 9090), VERDICT_DROP)
+
+    def test_djvu_magic_octet_stream_system_expression_dropped(self):
+        body = b"AT&TFORM\x00\x00\x00\x20DJVUANTa${system(encoded-command)}"
+        raw = (b"POST /api/imagery/ingest HTTP/1.1\r\n"
+               b"Content-Type: application/octet-stream\r\n\r\n" + body)
+        self.assertEqual(self._v(raw, 9090), VERDICT_DROP)
+
+    def test_normal_octet_stream_imagery_accepted(self):
+        raw = (b"POST /api/imagery/ingest HTTP/1.1\r\n"
+               b"Content-Type: application/octet-stream\r\n\r\nraw-camera-frame")
+        self.assertEqual(self._v(raw, 9090), VERDICT_ACCEPT)
+
+    def test_normal_image_accepted(self):
+        raw = b"POST /api/imagery/ingest HTTP/1.1\r\nContent-Type: image/png\r\n\r\nPNG"
+        self.assertEqual(self._v(raw, 9090), VERDICT_ACCEPT)
+
+    def test_tasking_file_uri_dropped(self):
+        body = b'{"type":"mission","plan":"file:///run/mission.json"}'
+        raw = b"POST /api/tasking HTTP/1.1\r\nContent-Type: application/json\r\n\r\n" + body
+        self.assertEqual(self._v(raw, 9090), VERDICT_DROP)
+
+    def test_inline_tasking_accepted(self):
+        body = b'{"type":"mission","plan":"inline-v1"}'
+        raw = b"POST /api/tasking HTTP/1.1\r\nContent-Type: application/json\r\n\r\n" + body
+        self.assertEqual(self._v(raw, 9090), VERDICT_ACCEPT)
+
+    def test_masked_admin_fleet_websocket_dropped(self):
+        msg = b'{"type":"admin_fleet_request"}'
+        key = b"abcd"
+        masked = bytes(b ^ key[i & 3] for i, b in enumerate(msg))
+        frame = bytes([0x81, 0x80 | len(msg)]) + key + masked
+        raw = (b"GET /ws/mission-feed HTTP/1.1\r\nUpgrade: websocket\r\n\r\n" + frame)
+        self.assertEqual(self._v(raw, 8082), VERDICT_DROP)
+
+    def test_ugv_exchange_python_exec_dropped(self):
+        raw = (b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+               b"g2dds.v1.Layer4Service/Exchange sample __import__('os').environ")
+        self.assertEqual(self._v(raw, 8410), VERDICT_DROP)
+
+    def test_ugv_exchange_sensitive_read_dropped_on_8420(self):
+        raw = (b"g2dds.v1.Layer4Service/Exchange sample "
+               b"open('../../../../proc/self/environ').read()")
+        self.assertEqual(self._v(raw, 8420), VERDICT_DROP)
+
+    def test_ugv_normal_exchange_accepted(self):
+        raw = b"g2dds.v1.Layer4Service/Exchange domainId participantId topicId sample telemetry"
+        self.assertEqual(self._v(raw, 8410), VERDICT_ACCEPT)
+
+    def test_ugv_exchange_base64_python_exec_dropped(self):
+        code = base64.b64encode(b"print(__import__('os').environ)")
+        raw = b"g2dds.v1.Layer4Service/Exchange code=" + code
+        self.assertEqual(self._v(raw, 8410), VERDICT_DROP)
+
+    def test_ugv_exchange_glob_file_harvest_dropped(self):
+        raw = (b"g2dds.v1.Layer4Service/Exchange code=import glob,io; "
+               b"files=glob.glob(pattern); handle=io.open(files[0]); handle.read()")
+        self.assertEqual(self._v(raw, 8410), VERDICT_DROP)
+
+    def test_ugv_exchange_indirect_file_reader_dropped(self):
+        raw = (b"g2dds.v1.Layer4Service/Exchange code=import os; "
+               b"reader=lambda p:getattr(open(p),'read')()")
+        self.assertEqual(self._v(raw, 8420), VERDICT_DROP)
+
+    def test_ugv_exchange_benign_open_status_accepted(self):
+        raw = (b"g2dds.v1.Layer4Service/Exchange status=open "
+               b"read=complete telemetry=nominal")
+        self.assertEqual(self._v(raw, 8410), VERDICT_ACCEPT)
 
 
 if __name__ == "__main__":
