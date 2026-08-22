@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import collections
 import hmac
+import os
 import re
 import struct
 import time
@@ -1586,6 +1587,110 @@ class TlsObserveDetector(Detector):
             f"sni={sni or '?'} (payload 기반 detector blind)")]
 
 
+# ── gRPC(h2c 평문) 진단 경로/번들 경로 이탈 차단 (본선 L1, P1-R2·P2-R5 승리벡터) ──────
+# protobuf length-delimited(문자열/bytes) 필드 태그: (field_num<<3)|2 = 필드 1~15.
+# P2-R5: ExportDiagnosticBundle이 민감 path를 필드 2/3/4(0x12/0x1a/0x22)에 실어 우회 → 전 필드 스캔.
+_PB_STR_RE = re.compile(
+    rb"[\x0a\x12\x1a\x22\x2a\x32\x3a\x42\x4a\x52\x5a\x62\x6a\x72\x7a]([\x01-\x7f])([ -~]{1,128})")
+
+
+class GrpcDiagGuardDetector(Detector):
+    """본선 L1 gateway의 평문 h2c gRPC TailDiagnosticLog 경로 이탈 차단 — P1-R2 승리벡터 대응.
+
+    9000은 평문 h2c gRPC(`/satdiag.v1.SatDiag/TailDiagnosticLog`)로, TailDiagnosticLog{path}가
+    진단 로그를 tail한다. 정상 path는 상대 `*.log`(gateway.log·telemetry.log·routing.log…),
+    공격은 `path:"/flag"`(절대 flag 파일)·traversal(`../flag`)·민감파일로 flag를 탈취한다.
+    구분자: 상대 `.log`만 허용, 절대·비-log·traversal·민감키워드는 차단. 포트 gating(9000).
+    암호화(TLS) 프레임엔 gRPC 마커가 안 보여 판정 보류(blind). 정상 로그 tail은 통과.
+    """
+
+    name = "grpc_diag_guard"
+
+    _SENSITIVE = ("flag", "secret", "token", "passwd", "shadow", "/etc/",
+                  "/proc/", "/root/", ".ssh", "credential", "private")
+    _METHOD_MARK = ("satdiag", ".v1.", "/taildiagnosticlog", "grpc.reflection")
+
+    def __init__(self, ports=(9000,), mode="enforce") -> None:
+        self.ports = {int(p) for p in ports}
+        self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
+
+    @property
+    def rule_count(self):
+        return 0 if self.mode == "off" else 1
+
+    def _is_attack(self, path: str) -> bool:
+        p = path.lower()
+        if ".." in p:                                       # traversal
+            return True
+        if any(k in p for k in self._SENSITIVE):            # 민감 대상(flag/secret/etc…)
+            return True
+        if any(c in path for c in (";", "|", "`", "$(", "&&", "\n", "\r")):  # 명령주입
+            return True
+        # 절대경로면서 .log가 아닌 파일 = 로그 tail 계약 이탈. 공백/'*'는 제외(응답 CSS 등 오탐 방지)
+        if (p.startswith("/") and len(p) > 1 and not p.endswith(".log")
+                and " " not in p and "*" not in p):
+            return True
+        return False
+
+    def inspect(self, ctx: PacketContext) -> list[Evidence]:
+        if self.mode == "off" or ctx.proto != 6 or ctx.dport not in self.ports:
+            return []
+        data = ctx.payload or b""
+        low = data.lower()
+        # 평문 gRPC/h2 마커가 없으면(암호화 TLS 등) 판정 보류 — payload blind
+        if b"grpc" not in low and b"satdiag" not in low and b"taildiagnosticlog" not in low:
+            return []
+        # HTTP/2면 DATA 프레임만 de-framing해 스캔한다(HEADERS 제외 → user-agent·accept-language
+        # 등 헤더값 오탐 방지). P2-R5 실측 1-byte-per-frame 분할 회피도 여기서 복원된다.
+        # 비-h2(인라인) payload는 프레임이 없어 de-framed가 비므로 raw를 스캔한다.
+        deframed = self._deframe_h2_data(data)
+        payloads = [deframed] if deframed else [data]
+        for payload in payloads:
+            for match in _PB_STR_RE.finditer(payload):
+                declared = match.group(1)[0]
+                body = match.group(2)
+                if len(body) < declared:
+                    continue
+                candidate = body[:declared].decode("latin-1", "ignore")
+                low_c = candidate.lower()
+                if any(mark in low_c for mark in self._METHOD_MARK):
+                    continue                                # gRPC 메서드 경로 자체는 제외
+                if self._is_attack(candidate):
+                    enforce = self.mode == "enforce"
+                    return [Evidence(
+                        1.0 if enforce else 0.0,
+                        f"gRPC diagnostic escapes to sensitive path: {candidate[:48]}",
+                        "grpc_diag:path", "SAT-GRPC-DIAG-PATH",
+                        EvidenceClass.ATTACK_PATTERN_CONFIRMED if enforce
+                        else EvidenceClass.OBSERVATION_ONLY,
+                        IdentificationBasis.STRUCTURE_VERIFIED,
+                        True, enforce, True)]
+        return []
+
+    @staticmethod
+    def _deframe_h2_data(data: bytes) -> bytes:
+        """HTTP/2 DATA 프레임(type 0)의 payload를 이어붙인다 — 1-byte-per-frame 분할 회피 복원.
+        9바이트 프레임 헤더(len3·type1·flags1·streamid4) 파싱. 프레임 수·출력 크기 상한(비용 제한)."""
+        start = 0
+        pre = data.find(b"PRI * HTTP/2")
+        if pre != -1:
+            sm = data.find(b"SM\r\n\r\n", pre)
+            start = sm + 6 if sm != -1 else pre
+        out = bytearray()
+        i, n, frames = start, len(data), 0
+        while i + 9 <= n and frames < 8192 and len(out) < 65536:
+            flen = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2]
+            ftype = data[i + 3]
+            i += 9
+            if i + flen > n:
+                break
+            if ftype == 0x00:                               # DATA
+                out += data[i:i + flen]
+            i += flen
+            frames += 1
+        return bytes(out)
+
+
 # ── MQTT 관찰기 (UGV 브로커, attacker-finals UGV-MQTT) ──────────────────────────
 # read-only 탈취: SUBSCRIBE(type 8)로 여러 topic을 구독해 flag 담긴 메시지를 읽는다. 여러 topic을
 # 훑는 것이 read 스캔이다. CONNECT/PUBLISH도 파싱하되 topic 열거만 차단 대상으로 둔다. MQTT는
@@ -1596,7 +1701,8 @@ class MqttDetector(Detector):
     name = "mqtt"
 
     def __init__(self, mode="observe", ports=None, weight=1.0,
-                 read_window=5.0, read_scan_targets=16, max_keys=4096, now=None) -> None:
+                 read_window=5.0, read_scan_targets=16, max_keys=4096, now=None,
+                 broad_enforce=None) -> None:
         self.mode = mode if mode in ("off", "observe", "enforce") else "observe"
         self.ports = {int(p) for p in (ports or [])}
         self.weight = float(weight)
@@ -1604,6 +1710,12 @@ class MqttDetector(Detector):
         self.read_scan_targets = max(1, int(read_scan_targets))
         self._now = now or time.monotonic
         self._reads = BoundedState(max(32, int(max_keys)), max(self.read_window * 2, 1.0), self._now)
+        # broad-wildcard(exact `#` 등) 단일 구독 차단은 기본 observe다. 정상 모니터/SLA 프로버가
+        # `#`·`$SYS/#`로 구독하는 경우가 흔해 enforce 시 SLA 오탐 위험이 있다(공격자의 #와 바이트
+        # 동일해 구분 불가). 열거(read-scan)는 여전히 enforce라 다중 broad 토픽 스캔 공격은 차단된다.
+        # 프로버가 #를 안 쓴다고 확인되면 DEF_MQTT_BROAD_ENFORCE=1로 즉시 enforce 전환(가역적).
+        self.broad_enforce = (broad_enforce if broad_enforce is not None
+                              else os.environ.get("DEF_MQTT_BROAD_ENFORCE", "0") == "1")
 
     @property
     def rule_count(self):
@@ -1644,10 +1756,41 @@ class MqttDetector(Detector):
             i += ln + (1 if has_qos else 0)             # SUBSCRIBE는 각 필터 뒤 QoS 1byte
         return out
 
+    @staticmethod
+    def _broad_wildcard(topic: bytes) -> bool:
+        """전체 namespace를 root부터 읽는 broad-global wildcard 구독인지 구조적으로 판정한다.
+        exact `#`, `+/#`, `+/+/#`, `$share/<group>/#`(shared) = broad(즉시 enforce 후보).
+        `uav/#`·`uav/telemetry/#`처럼 concrete 접두가 있으면 scoped → broad 아님(정상 wildcard 통과).
+        `#`는 마지막 단독 레벨이어야 유효(MQTT 규격)."""
+        try:
+            t = topic.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        if t.startswith("$share/"):                     # shared subscription → group 뒤 filter만 평가
+            parts = t.split("/", 2)
+            if len(parts) < 3 or not parts[1]:
+                return False
+            t = parts[2]
+        if not t or t[-1] != "#":
+            return False
+        levels = t.split("/")
+        if levels[-1] != "#":                            # # 는 마지막 단독 레벨
+            return False
+        return all(lv == "+" for lv in levels[:-1])      # # 앞 모든 레벨이 wildcard(+) = broad-global
+
     def inspect(self, ctx: PacketContext) -> list[Evidence]:
         if self.mode == "off" or not self.ports or ctx.proto != 6 or ctx.dport not in self.ports:
             return []
-        data = ctx.segment_payload or ctx.payload
+        # VerdictEngine은 현재 TCP connection generation에서 연속으로 재조립한
+        # stream prefix를 payload로 전달한다. segment를 우선하면 MQTT fixed
+        # header/VBI/topic이 TCP 경계에 걸린 실제 R10 SUBSCRIBE #를 놓친다.
+        data = ctx.payload or ctx.segment_payload or b""
+        # P2-R3 실측: MQTT 포트(8082)에 HTTP/GraphQL이 공존한다. 명백한 HTTP 요청/응답은 MQTT
+        # 고정헤더로 오분류(mqtt_length_over_buffer 등)하지 않도록 파싱에서 제외한다 — MQTT
+        # 제어패킷 첫 byte(0x10/0x30/0x82 등)는 아래 ASCII 메서드 문자열과 겹치지 않는다.
+        if data.startswith((b"GET ", b"POST ", b"PUT ", b"DELETE ", b"HEAD ",
+                            b"PATCH ", b"OPTIONS ", b"HTTP/")):
+            return []
         hits, topics, off, count = [], [], 0, 0
         while off + 2 <= len(data) and count < 32:
             ptype = data[off] >> 4
@@ -1663,10 +1806,25 @@ class MqttDetector(Detector):
                                           "MQTT-MALFORMED", actionable=False))
                 break
             if ptype in (8, 10):                        # SUBSCRIBE / UNSUBSCRIBE
-                topics += self._topics(data[body_off:end], has_qos=(ptype == 8))
+                tp = self._topics(data[body_off:end], has_qos=(ptype == 8))
+                topics += tp
+                if ptype == 8:                          # SUBSCRIBE만 broad-wildcard 평가
+                    for t in tp:
+                        if self._broad_wildcard(t):
+                            # exact `#`/shared-global 등 전체 namespace 구독. 단일 filter라도 broad-read
+                            # primitive지만, 정상 프로버 오탐 방지를 위해 기본 observe(actionable=broad_enforce).
+                            hits.append(self._hit(
+                                "mqtt_broad_wildcard_subscribe filter=" + t.decode("latin-1", "ignore")[:64],
+                                "MQTT-BROAD-SUBSCRIBE", actionable=self.broad_enforce))
+                            break
             off, count = end, count + 1
         if topics:
-            distinct = _track_scan(self._reads, _svc_key(ctx), topics, self._now(),
+            # MQTT broker에는 정상 subscriber가 동시에 많이 붙는다. 서비스(dst,dport) 하나로
+            # 합산하면 서로 무관한 client의 exact/scoped 구독이 임계를 넘어 정상 세션을 DROP한다
+            # (P4-R11 실측 MQTT-READ-SCAN 오탐). 열거는 한 TCP flow 안에서만 집계한다.
+            # root-global `#`는 별도 MQTT-BROAD-SUBSCRIBE가 즉시 차단하므로 방어 공백이 없다.
+            scan_key = ctx.flow if isinstance(ctx.flow, tuple) and len(ctx.flow) == 6 else _svc_key(ctx)
+            distinct = _track_scan(self._reads, scan_key, topics, self._now(),
                                    self.read_window, self.read_scan_targets)
             if distinct:
                 hits.append(self._hit(f"mqtt_topic_enumeration distinct={distinct}",
